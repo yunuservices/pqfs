@@ -6,10 +6,9 @@ use std::time::SystemTime;
 
 use anyhow::{Context, Result};
 use fuser::{FUSE_ROOT_ID, FileAttr, FileType};
-use tracing::error;
 
 use super::entry::{Entry, EntryKind};
-use super::{BLOCK_SIZE, INDEX_FILE, TTL};
+use super::{BLOCK_SIZE, INDEX_FILE};
 use crate::crypto::Crypto;
 
 /// The actual filesystem state. Mutated under an `Arc<Mutex<...>>` so that

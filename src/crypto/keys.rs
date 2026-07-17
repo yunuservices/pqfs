@@ -1,4 +1,4 @@
-use anyhow::{Context, Result, bail};
+use anyhow::{Result, bail};
 use argon2::Argon2;
 use chacha20poly1305::aead::KeyInit;
 use chacha20poly1305::{Key, XChaCha20Poly1305, XNonce};

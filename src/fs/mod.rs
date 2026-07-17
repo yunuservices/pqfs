@@ -5,8 +5,6 @@ mod wrapper;
 
 use std::time::Duration;
 
-pub(crate) use entry::{Entry, EntryKind};
-pub(crate) use inner::PqfsInner;
 pub use wrapper::Pqfs;
 
 pub(crate) const INDEX_FILE: &str = "pqfs.index";
