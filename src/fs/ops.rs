@@ -369,10 +369,10 @@ impl PqfsInner {
 
         self.entries.remove(&entry.ino);
         let data_path = self.data_path(entry.ino);
-        if data_path.exists() {
-            if let Err(e) = fs::remove_file(&data_path) {
-                warn!("failed to remove data file {}: {}", data_path.display(), e);
-            }
+        if data_path.exists()
+            && let Err(e) = fs::remove_file(&data_path)
+        {
+            warn!("failed to remove data file {}: {}", data_path.display(), e);
         }
         if let Err(e) = self.save_index() {
             error!("index save error: {}", e);

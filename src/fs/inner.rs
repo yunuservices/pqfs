@@ -81,7 +81,7 @@ impl PqfsInner {
         FileAttr {
             ino: entry.ino,
             size: entry.size,
-            blocks: (entry.size + BLOCK_SIZE - 1) / BLOCK_SIZE,
+            blocks: entry.size.div_ceil(BLOCK_SIZE),
             atime: now,
             mtime: now,
             ctime: now,

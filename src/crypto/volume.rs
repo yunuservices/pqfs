@@ -105,7 +105,7 @@ impl Crypto {
 
         let master_key = derive_master_key(&password_key, AsRef::<[u8]>::as_ref(&shared_secret))?;
 
-        Ok(Self::from_master_key(&master_key, header)?)
+        Self::from_master_key(&master_key, header)
     }
 
     fn save(&self, backend: &Path) -> Result<()> {
