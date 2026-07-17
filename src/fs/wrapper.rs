@@ -59,9 +59,9 @@ impl Pqfs {
     pub fn mount(args: Args) -> Result<()> {
         let header_exists = args.backend.join("pqfs.header").exists();
         let crypto = if header_exists {
-            Crypto::load(&args.password, &args.backend)?
+            Crypto::load(args.password.as_deref().unwrap(), &args.backend)?
         } else if args.init {
-            Crypto::init(&args.password, &args.backend)?
+            Crypto::init(args.password.as_deref().unwrap(), &args.backend)?
         } else {
             bail!(
                 "no volume found at {}; use --init to create one",
