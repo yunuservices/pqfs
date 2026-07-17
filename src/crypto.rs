@@ -9,7 +9,6 @@ use hkdf::Hkdf;
 use ml_kem::kem::{Ciphertext, Decapsulate, Encapsulate, Kem, KeyExport};
 use ml_kem::{MlKem768, Seed};
 use rand::Rng;
-use rand::rngs::OsRng;
 use serde::{Deserialize, Serialize};
 use sha2::Sha256;
 
@@ -47,7 +46,7 @@ impl Crypto {
         }
 
         let mut salt = [0u8; SALT_LEN];
-        OsRng.fill_bytes(&mut salt);
+        rand::rng().fill_bytes(&mut salt);
 
         let password_key = Self::derive_password_key(password, &salt)?;
         let pw_key = Key::try_from(password_key.as_slice())
@@ -182,7 +181,7 @@ impl Crypto {
 
     fn random_nonce() -> XNonce {
         let mut nonce = [0u8; NONCE_LEN];
-        OsRng.fill_bytes(&mut nonce);
+        rand::rng().fill_bytes(&mut nonce);
         XNonce::try_from(nonce.as_slice()).expect("nonce length is correct")
     }
 }
