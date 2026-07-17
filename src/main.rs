@@ -12,7 +12,8 @@ fn main() -> Result<()> {
         .with_env_filter(EnvFilter::from_default_env())
         .init();
 
-    let args = cli::Args::parse();
+    let mut args = cli::Args::parse();
+    args.resolve_password()?;
 
     info!(
         "pqfs starting: backend={}, mountpoint={}",

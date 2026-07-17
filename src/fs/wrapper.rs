@@ -2,7 +2,7 @@ use std::ffi::OsStr;
 use std::sync::{Arc, Mutex, mpsc};
 use std::thread::{self, JoinHandle};
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use fuser::{
     Filesystem, MountOption, ReplyAttr, ReplyCreate, ReplyData, ReplyDirectory, ReplyEmpty,
     ReplyEntry, ReplyOpen, ReplyWrite, Request,
@@ -57,10 +57,16 @@ impl Pqfs {
     }
 
     pub fn mount(args: Args) -> Result<()> {
-        let crypto = if args.backend.join("pqfs.header").exists() {
+        let header_exists = args.backend.join("pqfs.header").exists();
+        let crypto = if header_exists {
             Crypto::load(&args.password, &args.backend)?
-        } else {
+        } else if args.init {
             Crypto::init(&args.password, &args.backend)?
+        } else {
+            bail!(
+                "no volume found at {}; use --init to create one",
+                args.backend.display()
+            );
         };
 
         let inner = PqfsInner::load(args.backend.clone(), crypto)?;

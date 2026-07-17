@@ -53,7 +53,14 @@ cargo build --release --no-default-features --features ml-kem-1024
 ```bash
 # Create a new encrypted volume and mount it
 mkdir -p ~/pqfs-backend ~/pqfs-mnt
+./target/release/pqfs ~/pqfs-backend ~/pqfs-mnt --password "super secret" --init
+
+# Mount an existing volume (omit --init to avoid accidental creation)
 ./target/release/pqfs ~/pqfs-backend ~/pqfs-mnt --password "super secret"
+
+# Or use the environment variable (avoids shell history leakage)
+PQFS_PASSWORD="super secret" ./target/release/pqfs ~/pqfs-backend ~/pqfs-mnt
+```
 
 # In another terminal
 cd ~/pqfs-mnt
@@ -63,6 +70,20 @@ ls -la
 
 # Unmount
 fusermount -u ~/pqfs-mnt
+```
+
+### Docker quick-start
+
+```bash
+# Build image and keep a container running for manual testing
+docker compose up -d pqfs
+
+# Create and mount a volume inside the container
+docker compose exec pqfs pqfs /data /mnt/pqfs --password smoke-test --init
+docker compose exec pqfs pqfs /data /mnt/pqfs --password smoke-test
+
+# Or run the one-shot smoke test (creates, writes, reads, unmounts)
+docker compose --profile test run --rm smoke-test
 ```
 
 The encrypted backend (`~/pqfs-backend`) will contain:

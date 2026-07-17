@@ -27,6 +27,10 @@ services:
       sh -c '
         set -e
         mkdir -p /mnt/pqfs
+        if [ ! -f /data/pqfs.header ]; then
+          echo "[*] Creating new pqfs volume..."
+          pqfs /data /mnt/pqfs --password smoke-test --init
+        fi
         echo "[*] Mounting pqfs..."
         pqfs /data /mnt/pqfs --password smoke-test &
         sleep 2
