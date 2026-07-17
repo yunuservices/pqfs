@@ -83,7 +83,7 @@ impl Crypto {
             encrypted_seed: encrypted_seed_blob,
         };
 
-        let mut this = Self { cipher, header };
+        let this = Self { cipher, header };
         this.save(backend)?;
         Ok(this)
     }
