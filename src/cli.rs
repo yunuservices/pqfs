@@ -39,10 +39,8 @@ pub struct Args {
 impl Args {
     /// Resolve the password from CLI arg, env var, or interactive prompt.
     pub fn resolve_password(&mut self) -> Result<()> {
-        if let Some(pw) = &self.password {
-            if !pw.is_empty() {
-                return Ok(());
-            }
+        if self.password.as_ref().is_some_and(|pw| !pw.is_empty()) {
+            return Ok(());
         }
 
         if std::io::stdin().is_terminal() {
