@@ -71,10 +71,8 @@ impl Crypto {
         encrypted_seed_blob.extend_from_slice(sk_nonce.as_ref());
         encrypted_seed_blob.extend_from_slice(&encrypted_seed);
 
-        let master_key = Self::derive_master_key(
-            &password_key,
-            AsRef::<[u8]>::as_ref(&shared_secret),
-        )?;
+        let master_key =
+            Self::derive_master_key(&password_key, AsRef::<[u8]>::as_ref(&shared_secret))?;
 
         let header = VolumeHeader {
             salt,
@@ -104,8 +102,8 @@ impl Crypto {
             bail!("corrupted encrypted seed");
         }
         let (nonce, ct) = header.encrypted_seed.split_at(NONCE_LEN);
-        let nonce = XNonce::try_from(nonce)
-            .map_err(|_| anyhow::anyhow!("invalid seed nonce length"))?;
+        let nonce =
+            XNonce::try_from(nonce).map_err(|_| anyhow::anyhow!("invalid seed nonce length"))?;
         let seed_bytes = pw_cipher
             .decrypt(&nonce, ct)
             .context("password incorrect or corrupted volume")?;
@@ -121,10 +119,8 @@ impl Crypto {
             .map_err(|_| anyhow::anyhow!("invalid ML-KEM ciphertext"))?;
         let shared_secret = dk.decapsulate(&ct_array);
 
-        let master_key = Self::derive_master_key(
-            &password_key,
-            AsRef::<[u8]>::as_ref(&shared_secret),
-        )?;
+        let master_key =
+            Self::derive_master_key(&password_key, AsRef::<[u8]>::as_ref(&shared_secret))?;
 
         Ok(Self::from_master_key(&master_key, header)?)
     }
@@ -148,8 +144,7 @@ impl Crypto {
             bail!("ciphertext too short");
         }
         let (nonce, ct) = blob.split_at(NONCE_LEN);
-        let nonce = XNonce::try_from(nonce)
-            .map_err(|_| anyhow::anyhow!("invalid nonce length"))?;
+        let nonce = XNonce::try_from(nonce).map_err(|_| anyhow::anyhow!("invalid nonce length"))?;
         self.cipher
             .decrypt(&nonce, ct)
             .context("decryption failed (corrupted or tampered data)")
@@ -244,6 +239,37 @@ impl Crypto {
             .decrypt(&nonce, ct)
             .context("filename decryption failed")?;
         String::from_utf8(plaintext).context("filename is not valid UTF-8")
+    }
+
+    pub fn random_key(&self) -> [u8; KEY_LEN] {
+        let mut key = [0u8; KEY_LEN];
+        rand::rng().fill_bytes(&mut key);
+        key
+    }
+
+    pub fn encrypt_with_key(&self, key: &[u8], plaintext: &[u8]) -> Result<Vec<u8>> {
+        let cipher = Self::build_cipher(key)?;
+        let nonce = Self::random_nonce();
+        let ciphertext = cipher
+            .encrypt(&nonce, plaintext)
+            .context("per-file key encryption failed")?;
+        let mut out = Vec::with_capacity(NONCE_LEN + ciphertext.len());
+        out.extend_from_slice(nonce.as_ref());
+        out.extend_from_slice(&ciphertext);
+        Ok(out)
+    }
+
+    pub fn decrypt_with_key(&self, key: &[u8], blob: &[u8]) -> Result<Vec<u8>> {
+        if blob.len() < NONCE_LEN + 16 {
+            bail!("per-file ciphertext too short");
+        }
+        let (nonce, ct) = blob.split_at(NONCE_LEN);
+        let nonce = XNonce::try_from(nonce)
+            .map_err(|_| anyhow::anyhow!("invalid per-file nonce length"))?;
+        let cipher = Self::build_cipher(key)?;
+        cipher
+            .decrypt(&nonce, ct)
+            .context("per-file key decryption failed")
     }
 
     fn random_nonce() -> XNonce {

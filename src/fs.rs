@@ -33,6 +33,7 @@ struct Entry {
     parent: u64,
     name_hash: [u8; 32],
     name_encrypted: Vec<u8>,
+    content_key: Vec<u8>, // encrypted per-file key (empty for directories)
     kind: EntryKind,
     size: u64,
     perm: u16,
@@ -97,7 +98,9 @@ impl Pqfs {
         } else {
             let mut map = BTreeMap::new();
             let root_hash = crypto.hash_filename("");
-            let root_name = crypto.encrypt_filename("").context("failed to encrypt root name")?;
+            let root_name = crypto
+                .encrypt_filename("")
+                .context("failed to encrypt root name")?;
             map.insert(
                 FUSE_ROOT_ID,
                 Entry {
@@ -105,6 +108,7 @@ impl Pqfs {
                     parent: FUSE_ROOT_ID,
                     name_hash: root_hash,
                     name_encrypted: root_name,
+                    content_key: Vec::new(),
                     kind: EntryKind::Dir,
                     size: 0,
                     perm: 0o755,
@@ -212,7 +216,7 @@ impl Filesystem for Pqfs {
         _lock_owner: Option<u64>,
         reply: ReplyData,
     ) {
-        let Some(entry) = self.entries.get(&ino) else {
+        let Some(entry) = self.entries.get(&ino).cloned() else {
             reply.error(ENOENT);
             return;
         };
@@ -235,12 +239,39 @@ impl Filesystem for Pqfs {
             }
         };
 
-        let plaintext = match self.crypto.decrypt(&ciphertext) {
-            Ok(v) => v,
-            Err(e) => {
-                error!("decrypt error for inode {}: {}", ino, e);
-                reply.error(EIO);
-                return;
+        let plaintext = if entry.content_key.is_empty() {
+            // Legacy file: content encrypted directly with the master key.
+            match self.crypto.decrypt(&ciphertext) {
+                Ok(v) => v,
+                Err(e) => {
+                    error!("decrypt error for inode {}: {}", ino, e);
+                    reply.error(EIO);
+                    return;
+                }
+            }
+        } else {
+            let content_key = match self.crypto.decrypt(&entry.content_key) {
+                Ok(v) => {
+                    if v.len() != 32 {
+                        error!("bad per-file key length for inode {}: {}", ino, v.len());
+                        reply.error(EIO);
+                        return;
+                    }
+                    v
+                }
+                Err(e) => {
+                    error!("content key decrypt error for inode {}: {}", ino, e);
+                    reply.error(EIO);
+                    return;
+                }
+            };
+            match self.crypto.decrypt_with_key(&content_key, &ciphertext) {
+                Ok(v) => v,
+                Err(e) => {
+                    error!("decrypt error for inode {}: {}", ino, e);
+                    reply.error(EIO);
+                    return;
+                }
             }
         };
 
@@ -261,8 +292,8 @@ impl Filesystem for Pqfs {
         _lock_owner: Option<u64>,
         reply: ReplyWrite,
     ) {
-        match self.entries.get(&ino) {
-            Some(entry) if matches!(entry.kind, EntryKind::File) => {}
+        let mut entry = match self.entries.get(&ino).cloned() {
+            Some(e) if matches!(e.kind, EntryKind::File) => e,
             Some(_) => {
                 reply.error(EISDIR);
                 return;
@@ -271,19 +302,48 @@ impl Filesystem for Pqfs {
                 reply.error(ENOENT);
                 return;
             }
-        }
+        };
 
         let data_path = self.data_path(ino);
         let mut plaintext = if data_path.exists() {
             match fs::read(&data_path) {
-                Ok(ct) => match self.crypto.decrypt(&ct) {
-                    Ok(pt) => pt,
-                    Err(e) => {
-                        error!("decrypt error on write for {}: {}", data_path.display(), e);
-                        reply.error(EIO);
-                        return;
+                Ok(ct) => {
+                    if entry.content_key.is_empty() {
+                        // Legacy file: decrypt with the master key and convert below.
+                        match self.crypto.decrypt(&ct) {
+                            Ok(pt) => pt,
+                            Err(e) => {
+                                error!("decrypt error on write for {}: {}", data_path.display(), e);
+                                reply.error(EIO);
+                                return;
+                            }
+                        }
+                    } else {
+                        let content_key = match self.crypto.decrypt(&entry.content_key) {
+                            Ok(v) => {
+                                if v.len() != 32 {
+                                    error!("bad per-file key length for inode {}", ino);
+                                    reply.error(EIO);
+                                    return;
+                                }
+                                v
+                            }
+                            Err(e) => {
+                                error!("content key decrypt error for inode {}: {}", ino, e);
+                                reply.error(EIO);
+                                return;
+                            }
+                        };
+                        match self.crypto.decrypt_with_key(&content_key, &ct) {
+                            Ok(pt) => pt,
+                            Err(e) => {
+                                error!("decrypt error on write for {}: {}", data_path.display(), e);
+                                reply.error(EIO);
+                                return;
+                            }
+                        }
                     }
-                },
+                }
                 Err(e) => {
                     error!("read error on write for {}: {}", data_path.display(), e);
                     reply.error(EIO);
@@ -292,6 +352,38 @@ impl Filesystem for Pqfs {
             }
         } else {
             Vec::new()
+        };
+
+        // Ensure this file has its own per-file key.
+        if entry.content_key.is_empty() {
+            let key = self.crypto.random_key();
+            match self.crypto.encrypt(&key) {
+                Ok(v) => entry.content_key = v,
+                Err(e) => {
+                    error!("content key encrypt error for inode {}: {}", ino, e);
+                    reply.error(EIO);
+                    return;
+                }
+            }
+            if let Some(e) = self.entries.get_mut(&ino) {
+                e.content_key = entry.content_key.clone();
+            }
+        }
+
+        let content_key = match self.crypto.decrypt(&entry.content_key) {
+            Ok(v) => {
+                if v.len() != 32 {
+                    error!("bad per-file key length for inode {}", ino);
+                    reply.error(EIO);
+                    return;
+                }
+                v
+            }
+            Err(e) => {
+                error!("content key decrypt error for inode {}: {}", ino, e);
+                reply.error(EIO);
+                return;
+            }
         };
 
         let offset = offset as usize;
@@ -304,7 +396,7 @@ impl Filesystem for Pqfs {
         }
         plaintext[offset..end].copy_from_slice(data);
 
-        let ciphertext = match self.crypto.encrypt(&plaintext) {
+        let ciphertext = match self.crypto.encrypt_with_key(&content_key, &plaintext) {
             Ok(v) => v,
             Err(e) => {
                 error!("encrypt error for {}: {}", data_path.display(), e);
@@ -319,8 +411,8 @@ impl Filesystem for Pqfs {
             return;
         }
 
-        if let Some(entry) = self.entries.get_mut(&ino) {
-            entry.size = plaintext.len() as u64;
+        if let Some(e) = self.entries.get_mut(&ino) {
+            e.size = plaintext.len() as u64;
         }
         if let Err(e) = self.save_index() {
             error!("index save error: {}", e);
@@ -406,11 +498,20 @@ impl Filesystem for Pqfs {
                 return;
             }
         };
+        let content_key = match self.crypto.encrypt(&self.crypto.random_key()) {
+            Ok(v) => v,
+            Err(e) => {
+                error!("content key encryption error: {}", e);
+                reply.error(EIO);
+                return;
+            }
+        };
         let entry = Entry {
             ino,
             parent,
             name_hash,
             name_encrypted,
+            content_key,
             kind: EntryKind::File,
             size: 0,
             perm: (mode as u16) & 0o777,
@@ -458,6 +559,7 @@ impl Filesystem for Pqfs {
             parent,
             name_hash,
             name_encrypted,
+            content_key: Vec::new(),
             kind: EntryKind::Dir,
             size: 0,
             perm: (mode as u16) & 0o777,
