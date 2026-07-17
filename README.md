@@ -2,31 +2,42 @@
 
 A hybrid post-quantum FUSE filesystem written in Rust.
 
-> **Research prototype.** Not audited. Do not use for real data.
+> [!CAUTION]
+> **Research prototype / not audited.** DO NOT use pqfs for real or sensitive
+> data. It is intended for learning and experimentation.
 
-`pqfs` mounts a user-space filesystem on top of an encrypted backend directory. Every file and the directory index are encrypted with **XChaCha20Poly1305**. The master key is derived from a password and the shared secret of a selected **ML-KEM** parameter-set encapsulation (default **ML-KEM-768**), giving a hybrid classical + post-quantum key establishment.
+`pqfs` mounts a userspace filesystem on top of an encrypted backend directory.
+Files, directories, and file names are authenticated and encrypted with
+**XChaCha20Poly1305**. The master key is derived from your password and an
+**ML-KEM** shared secret (default **ML-KEM-768**), combining classical and
+post-quantum protection.
 
 ## Why?
 
-"Harvest now, decrypt later" is a real threat: encrypted data stolen today could be decrypted by future quantum computers. `pqfs` is a small proof-of-concept that experiments with protecting long-lived data using a hybrid key encapsulation mechanism (password + ML-KEM).
+“Harvest now, decrypt later” protection: a password + ML-KEM hybrid key makes
+stolen ciphertext harder to decrypt with future quantum computers.
 
 ## Features
 
 - FUSE userspace filesystem in Rust (`fuser`)
-- Hybrid key derivation: Argon2(password) + ML-KEM shared secret (ML-KEM-512 / 768 / 1024 selectable at compile time)
-- Authenticated encryption for file contents, directory index, and file names (XChaCha20Poly1305)
+- Hybrid key derivation: Argon2(password) + ML-KEM shared secret
+  (ML-KEM-512 / 768 / 1024 selectable at compile time)
+- Authenticated encryption for file contents, directory index, and file names
+  (XChaCha20Poly1305)
 - Per-file content keys wrapped by the master key
 - File-name encryption via HMAC-based lookup + XChaCha20Poly1305
-- Async read/write dispatch to a worker thread pool so the FUSE loop does not block on I/O or crypto
+- Concurrent reads: metadata is protected by an `RwLock` and long-running I/O
+  and crypto work is offloaded to a worker thread pool
 - Small, modular codebase suitable for learning and extending
-- CLI with mount options
+- CLI with hidden password prompt and `PQFS_PASSWORD` environment-variable support
+- Custom FUSE mount options via `-o`
 
 ## Stack
 
 | Layer | Crate |
 |-------|-------|
 | FUSE | `fuser` |
-| Post-quantum KEM | `ml-kem` (ML-KEM-512 / 768 / 1024) |
+| Post-quantum KEM | `ml-kem` |
 | AEAD | `chacha20poly1305` |
 | Password hashing | `argon2` |
 | Key derivation | `hkdf` + `sha2` |
@@ -34,11 +45,11 @@ A hybrid post-quantum FUSE filesystem written in Rust.
 
 ## Build
 
-Linux or WSL is required. `fuser` links against libfuse.
+Linux or WSL is required. `fuser` links against libfuse3.
 
 ```bash
 # Debian/Ubuntu dependencies
-sudo apt-get install -y libfuse-dev pkg-config
+sudo apt-get install -y libfuse3-dev pkg-config
 
 # Default: ML-KEM-768
 cargo build --release
@@ -48,28 +59,35 @@ cargo build --release --no-default-features --features ml-kem-512
 cargo build --release --no-default-features --features ml-kem-1024
 ```
 
-## Usage
+## Quick start
 
 ```bash
-# Create a new encrypted volume and mount it
+# 1. Create backend and mountpoint directories
 mkdir -p ~/pqfs-backend ~/pqfs-mnt
+
+# 2. Create a new volume and mount it
 ./target/release/pqfs ~/pqfs-backend ~/pqfs-mnt --password "super secret" --init
 
-# Mount an existing volume (omit --init to avoid accidental creation)
-./target/release/pqfs ~/pqfs-backend ~/pqfs-mnt --password "super secret"
-
-# Or use the environment variable (avoids shell history leakage)
-PQFS_PASSWORD="super secret" ./target/release/pqfs ~/pqfs-backend ~/pqfs-mnt
-```
-
-# In another terminal
+# In another terminal:
 cd ~/pqfs-mnt
 echo "hello quantum world" > test.txt
 cat test.txt
 ls -la
 
 # Unmount
-fusermount -u ~/pqfs-mnt
+fusermount3 -u ~/pqfs-mnt
+```
+
+Mount an existing volume by omitting `--init`:
+
+```bash
+./target/release/pqfs ~/pqfs-backend ~/pqfs-mnt --password "super secret"
+```
+
+Use the environment variable to avoid leaking the password in shell history:
+
+```bash
+PQFS_PASSWORD="super secret" ./target/release/pqfs ~/pqfs-backend ~/pqfs-mnt
 ```
 
 ### Docker quick-start
@@ -86,18 +104,46 @@ docker compose exec pqfs pqfs /data /mnt/pqfs --password smoke-test
 docker compose --profile test run --rm smoke-test
 ```
 
-The encrypted backend (`~/pqfs-backend`) will contain:
+### On-disk layout
+
+After initialization, the encrypted backend (`~/pqfs-backend`) contains:
 
 - `pqfs.header` — encrypted ML-KEM seed, public key, ciphertext, and salt
 - `pqfs.index` — encrypted directory index
 - `data/` — per-inode encrypted file contents
 
-## Security Notes
+## Threat model
 
-- This is a **proof of concept** for educational purposes.
-- No formal audit has been performed.
-- The ML-KEM secret seed is stored in the backend, encrypted with a key derived from your password. An attacker needs both the backend and the password to recover it.
-- FUSE userspace filesystems are not as fast as kernel-native encrypted filesystems (e.g., dm-crypt / LUKS).
+### What pqfs tries to protect against
+
+- **Offline backend theft.** If an attacker steals the backend directory, the
+  files, directory index, and file names are encrypted. The ML-KEM secret seed
+  is also stored in the backend, but it is encrypted with a key derived from
+  the password, so the attacker needs both the backend and the password.
+- **Harvest-now-decrypt-later.** The master key combines a classical password
+  derivation (Argon2) with an ML-KEM shared secret. Even if a future quantum
+  computer breaks the password-derived classical component, recovering the
+  key still requires breaking ML-KEM.
+- **Accidental metadata leakage.** File names are hashed for lookups and
+  encrypted for storage, so plain file names do not appear on disk.
+
+### What pqfs does *not* protect against
+
+- **A compromised running system.** Once the filesystem is mounted, plaintext
+  data lives in process memory and is visible to anything with access to the
+  mountpoint or the kernel.
+- **Weak passwords.** Argon2 slows guessing, but a short or guessable password
+  can still be brute-forced.
+- **Active attackers on the host.** A malicious kernel module, root user, or
+  another process with sufficient privileges can observe or modify data while
+  the filesystem is mounted.
+- **Rollback / snapshot attacks.** The backend has no versioning or integrity
+  log; an attacker with write access can replay an older `pqfs.index` or data
+  file.
+- **Multi-user access control.** `pqfs` does not implement its own user model;
+  access is governed by the UNIX permissions of the FUSE mountpoint.
+- **Side channels and Denial of Service.** File sizes, directory structure,
+  access timing, and write patterns leak information and are not hidden.
 
 ## Architecture
 
@@ -110,9 +156,10 @@ The encrypted backend (`~/pqfs-backend`) will contain:
 ┌──────────────▼──────────────────────┐
 │  Pqfs (src/fs/wrapper.rs)           │
 │  - worker thread pool               │
+│  - shared Crypto + RwLock metadata  │
 ├──────────────┬──────────────────────┤
 │  PqfsInner (src/fs/inner.rs)        │
-│  - directory index (BTreeMap)     │
+│  - directory index (BTreeMap)       │
 │  - per-inode encrypted data files   │
 ├──────────────┼──────────────────────┤
 │  Ops (src/fs/ops.rs)                │
@@ -129,7 +176,7 @@ The encrypted backend (`~/pqfs-backend`) will contain:
 └─────────────────────────────────────┘
 ```
 
-## Roadmap / Ideas
+## Roadmap / ideas
 
 - [x] File-name encryption
 - [x] Per-file keys instead of one master key
@@ -137,3 +184,7 @@ The encrypted backend (`~/pqfs-backend`) will contain:
 - [ ] Benchmark vs. ext4 / LUKS
 - [ ] Switchable AES-256-GCM vs. ChaCha20-Poly1305
 - [x] ML-KEM-1024 / ML-KEM-512 parameter option
+
+## License
+
+Distributed under the MIT License. See `LICENSE` for details.
