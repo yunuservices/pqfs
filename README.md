@@ -87,17 +87,24 @@ The encrypted backend (`~/pqfs-backend`) will contain:
 └──────────────┬──────────────────────┘
                │ Filesystem trait
 ┌──────────────▼──────────────────────┐
-│  Pqfs / PqfsInner (src/pqfs.rs)     │
+│  Pqfs (src/fs/wrapper.rs)           │
 │  - worker thread pool               │
-│  - directory index (BTreeMap)       │
+├──────────────┬──────────────────────┤
+│  PqfsInner (src/fs/inner.rs)        │
+│  - directory index (BTreeMap)     │
 │  - per-inode encrypted data files   │
+├──────────────┼──────────────────────┤
+│  Ops (src/fs/ops.rs)                │
+│  Entry (src/fs/entry.rs)            │
 └──────────────┬──────────────────────┘
                │ encrypt / decrypt
 ┌──────────────▼──────────────────────┐
-│  Crypto (src/crypto.rs)             │
-│  - Argon2(password)                 │
-│  - ML-KEM hybrid KEM                │
-│  - XChaCha20Poly1305                │
+│  Crypto (src/crypto/)               │
+│  - volume.rs (init/load)            │
+│  - aead.rs (XChaCha20Poly1305)      │
+│  - filename.rs (name HMAC/encrypt)  │
+│  - keys.rs (Argon2/HKDF)            │
+│  - kem.rs (ML-KEM parameter set)    │
 └─────────────────────────────────────┘
 ```
 
