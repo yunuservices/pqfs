@@ -7,7 +7,7 @@ use fuser::{
     FileType, ReplyAttr, ReplyCreate, ReplyData, ReplyDirectory, ReplyEmpty, ReplyEntry, ReplyOpen,
     ReplyWrite,
 };
-use libc::{EEXIST, EIO, EISDIR, ENOENT, ENOTDIR, ENOTEMPTY};
+use libc::{EEXIST, EIO, ENOENT, ENOTDIR, ENOTEMPTY};
 use tracing::{error, warn};
 
 use super::TTL;
@@ -24,7 +24,7 @@ impl PqfsInner {
         }
     }
 
-    pub(crate) fn getattr(&self, crypto: &Crypto, ino: u64, reply: ReplyAttr) {
+    pub(crate) fn getattr(&self, _crypto: &Crypto, ino: u64, reply: ReplyAttr) {
         if let Some(entry) = self.entries.get(&ino).cloned() {
             reply.attr(&TTL, &self.attr_for(&entry));
         } else {
@@ -115,10 +115,7 @@ impl PqfsInner {
             entry.content_key.clone()
         };
 
-        let content_key = match decrypt_content_key(crypto, &content_key_enc, entry.ino) {
-            Ok(v) => v,
-            Err(code) => return Err(code),
-        };
+        let content_key = decrypt_content_key(crypto, &content_key_enc, entry.ino)?;
 
         let offset = offset as usize;
         if offset > plaintext.len() {
@@ -349,14 +346,6 @@ impl PqfsInner {
 
     pub(crate) fn release(reply: ReplyEmpty) {
         reply.ok();
-    }
-
-    /// Return a file entry snapshot to be used outside the metadata lock.
-    pub(crate) fn file_entry(&self, ino: u64) -> Option<Entry> {
-        self.entries
-            .get(&ino)
-            .filter(|e| matches!(e.kind, EntryKind::File))
-            .cloned()
     }
 
     /// Update the metadata after a write has completed on disk.

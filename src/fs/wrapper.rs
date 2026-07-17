@@ -153,7 +153,6 @@ impl Filesystem for Pqfs {
         _lock_owner: Option<u64>,
         reply: ReplyData,
     ) {
-        let inner = Arc::clone(&self.inner);
         let crypto = Arc::clone(&self.crypto);
 
         let (entry, data_path) = {
