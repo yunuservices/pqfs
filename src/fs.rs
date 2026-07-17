@@ -7,14 +7,13 @@ use std::time::{Duration, SystemTime};
 
 use anyhow::{Context, Result};
 use fuser::{
-    FUSE_ROOT_ID, FileAttr, FileType, Filesystem, MountOption, ReplyAttr, ReplyCreate, ReplyData,
+    FUSE_ROOT_ID, FileAttr, FileType, Filesystem, ReplyAttr, ReplyCreate, ReplyData,
     ReplyDirectory, ReplyEmpty, ReplyEntry, ReplyOpen, ReplyWrite, Request,
 };
 use libc::{EEXIST, EIO, EISDIR, ENOENT, ENOTDIR, ENOTEMPTY};
 use serde::{Deserialize, Serialize};
-use tracing::{debug, error, warn};
+use tracing::{error, warn};
 
-use crate::cli::Args;
 use crate::crypto::Crypto;
 
 const INDEX_FILE: &str = "pqfs.index";
@@ -41,49 +40,15 @@ struct Entry {
     gid: u32,
 }
 
-pub struct Pqfs {
+pub(crate) struct PqfsInner {
     backend: PathBuf,
     crypto: Crypto,
     entries: BTreeMap<u64, Entry>,
     next_ino: u64,
 }
 
-impl Pqfs {
-    pub fn mount(args: Args) -> Result<()> {
-        let crypto = if args.backend.join("pqfs.header").exists() {
-            Crypto::load(&args.password, &args.backend)?
-        } else {
-            Crypto::init(&args.password, &args.backend)?
-        };
-
-        let fs = Self::load(args.backend.clone(), crypto)?;
-
-        let mut mount_options = vec![
-            MountOption::FSName("pqfs".to_string()),
-            MountOption::Subtype("pqfs".to_string()),
-            MountOption::NoAtime,
-        ];
-
-        if args.options.iter().any(|o| o == "ro") {
-            mount_options.push(MountOption::RO);
-        } else {
-            mount_options.push(MountOption::RW);
-        }
-
-        for opt in &args.options {
-            if opt == "ro" || opt == "rw" {
-                continue;
-            }
-            mount_options.push(MountOption::CUSTOM(opt.clone()));
-        }
-
-        debug!("pqfs mounted at {}", args.mountpoint.display());
-        fuser::mount2(fs, &args.mountpoint, &mount_options)
-            .with_context(|| format!("failed to mount at {}", args.mountpoint.display()))?;
-        Ok(())
-    }
-
-    fn load(backend: PathBuf, crypto: Crypto) -> Result<Self> {
+impl PqfsInner {
+    pub(crate) fn load(backend: PathBuf, crypto: Crypto) -> Result<Self> {
         fs::create_dir_all(&backend)?;
         fs::create_dir_all(backend.join("data"))?;
 
@@ -186,36 +151,10 @@ impl Pqfs {
         self.next_ino += 1;
         ino
     }
-}
 
-impl Filesystem for Pqfs {
-    fn lookup(&mut self, _req: &Request<'_>, parent: u64, name: &OsStr, reply: ReplyEntry) {
-        if let Some(entry) = self.find_child(parent, name).cloned() {
-            reply.entry(&TTL, &self.attr_for(&entry), 0);
-        } else {
-            reply.error(ENOENT);
-        }
-    }
-
-    fn getattr(&mut self, _req: &Request<'_>, ino: u64, reply: ReplyAttr) {
-        if let Some(entry) = self.entries.get(&ino).cloned() {
-            reply.attr(&TTL, &self.attr_for(&entry));
-        } else {
-            reply.error(ENOENT);
-        }
-    }
-
-    fn read(
-        &mut self,
-        _req: &Request<'_>,
-        ino: u64,
-        _fh: u64,
-        offset: i64,
-        size: u32,
-        _flags: i32,
-        _lock_owner: Option<u64>,
-        reply: ReplyData,
-    ) {
+    /// Synchronous counterpart of `Filesystem::read`, callable from worker
+    /// threads that do not hold a `fuser::Request` reference.
+    pub(crate) fn do_read(&mut self, ino: u64, offset: i64, size: u32, reply: ReplyData) {
         let Some(entry) = self.entries.get(&ino).cloned() else {
             reply.error(ENOENT);
             return;
@@ -280,18 +219,9 @@ impl Filesystem for Pqfs {
         reply.data(&plaintext[offset..end]);
     }
 
-    fn write(
-        &mut self,
-        _req: &Request<'_>,
-        ino: u64,
-        _fh: u64,
-        offset: i64,
-        data: &[u8],
-        _write_flags: u32,
-        _flags: i32,
-        _lock_owner: Option<u64>,
-        reply: ReplyWrite,
-    ) {
+    /// Synchronous counterpart of `Filesystem::write`, callable from worker
+    /// threads that do not hold a `fuser::Request` reference.
+    pub(crate) fn do_write(&mut self, ino: u64, offset: i64, data: &[u8], reply: ReplyWrite) {
         let mut entry = match self.entries.get(&ino).cloned() {
             Some(e) if matches!(e.kind, EntryKind::File) => e,
             Some(_) => {
@@ -421,6 +351,53 @@ impl Filesystem for Pqfs {
         }
 
         reply.written(data.len() as u32);
+    }
+}
+
+impl Filesystem for PqfsInner {
+    fn lookup(&mut self, _req: &Request<'_>, parent: u64, name: &OsStr, reply: ReplyEntry) {
+        if let Some(entry) = self.find_child(parent, name).cloned() {
+            reply.entry(&TTL, &self.attr_for(&entry), 0);
+        } else {
+            reply.error(ENOENT);
+        }
+    }
+
+    fn getattr(&mut self, _req: &Request<'_>, ino: u64, reply: ReplyAttr) {
+        if let Some(entry) = self.entries.get(&ino).cloned() {
+            reply.attr(&TTL, &self.attr_for(&entry));
+        } else {
+            reply.error(ENOENT);
+        }
+    }
+
+    fn read(
+        &mut self,
+        _req: &Request<'_>,
+        ino: u64,
+        _fh: u64,
+        offset: i64,
+        size: u32,
+        _flags: i32,
+        _lock_owner: Option<u64>,
+        reply: ReplyData,
+    ) {
+        self.do_read(ino, offset, size, reply);
+    }
+
+    fn write(
+        &mut self,
+        _req: &Request<'_>,
+        ino: u64,
+        _fh: u64,
+        offset: i64,
+        data: &[u8],
+        _write_flags: u32,
+        _flags: i32,
+        _lock_owner: Option<u64>,
+        reply: ReplyWrite,
+    ) {
+        self.do_write(ino, offset, data, reply);
     }
 
     fn readdir(

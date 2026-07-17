@@ -17,6 +17,7 @@ A hybrid post-quantum FUSE filesystem written in Rust.
 - Authenticated encryption for file contents, directory index, and file names (XChaCha20Poly1305)
 - Per-file content keys wrapped by the master key
 - File-name encryption via HMAC-based lookup + XChaCha20Poly1305
+- Async read/write dispatch to a worker thread pool so the FUSE loop does not block on I/O or crypto
 - Small, modular codebase suitable for learning and extending
 - CLI with mount options
 
@@ -86,7 +87,8 @@ The encrypted backend (`~/pqfs-backend`) will contain:
 └──────────────┬──────────────────────┘
                │ Filesystem trait
 ┌──────────────▼──────────────────────┐
-│  Pqfs (src/fs.rs)                   │
+│  Pqfs / PqfsInner (src/pqfs.rs)     │
+│  - worker thread pool               │
 │  - directory index (BTreeMap)       │
 │  - per-inode encrypted data files   │
 └──────────────┬──────────────────────┘
@@ -103,7 +105,7 @@ The encrypted backend (`~/pqfs-backend`) will contain:
 
 - [x] File-name encryption
 - [x] Per-file keys instead of one master key
-- [ ] Async / multi-threaded FUSE
+- [x] Async / multi-threaded FUSE
 - [ ] Benchmark vs. ext4 / LUKS
 - [ ] Switchable AES-256-GCM vs. ChaCha20-Poly1305
 - [x] ML-KEM-1024 / ML-KEM-512 parameter option

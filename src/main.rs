@@ -1,6 +1,7 @@
 mod cli;
 mod crypto;
 mod fs;
+mod pqfs;
 
 use anyhow::Result;
 use clap::Parser;
@@ -20,5 +21,5 @@ fn main() -> Result<()> {
         args.mountpoint.display()
     );
 
-    fs::Pqfs::mount(args)
+    pqfs::Pqfs::mount(args)
 }
