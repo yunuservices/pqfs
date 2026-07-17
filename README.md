@@ -4,7 +4,7 @@ A hybrid post-quantum FUSE filesystem written in Rust.
 
 > **Research prototype.** Not audited. Do not use for real data.
 
-`pqfs` mounts a user-space filesystem on top of an encrypted backend directory. Every file and the directory index are encrypted with **XChaCha20Poly1305**. The master key is derived from a password and the shared secret of an **ML-KEM-768** encapsulation, giving a hybrid classical + post-quantum key establishment.
+`pqfs` mounts a user-space filesystem on top of an encrypted backend directory. Every file and the directory index are encrypted with **XChaCha20Poly1305**. The master key is derived from a password and the shared secret of a selected **ML-KEM** parameter-set encapsulation (default **ML-KEM-768**), giving a hybrid classical + post-quantum key establishment.
 
 ## Why?
 
@@ -13,7 +13,7 @@ A hybrid post-quantum FUSE filesystem written in Rust.
 ## Features
 
 - FUSE userspace filesystem in Rust (`fuser`)
-- Hybrid key derivation: Argon2(password) + ML-KEM-768 shared secret
+- Hybrid key derivation: Argon2(password) + ML-KEM shared secret (ML-KEM-512 / 768 / 1024 selectable at compile time)
 - Authenticated encryption for file contents, directory index, and file names (XChaCha20Poly1305)
 - Per-file content keys wrapped by the master key
 - File-name encryption via HMAC-based lookup + XChaCha20Poly1305
@@ -25,7 +25,7 @@ A hybrid post-quantum FUSE filesystem written in Rust.
 | Layer | Crate |
 |-------|-------|
 | FUSE | `fuser` |
-| Post-quantum KEM | `ml-kem` (ML-KEM-768) |
+| Post-quantum KEM | `ml-kem` (ML-KEM-512 / 768 / 1024) |
 | AEAD | `chacha20poly1305` |
 | Password hashing | `argon2` |
 | Key derivation | `hkdf` + `sha2` |
@@ -39,8 +39,12 @@ Linux or WSL is required. `fuser` links against libfuse.
 # Debian/Ubuntu dependencies
 sudo apt-get install -y libfuse-dev pkg-config
 
-# Build
+# Default: ML-KEM-768
 cargo build --release
+
+# Alternative ML-KEM parameter sets
+cargo build --release --no-default-features --features ml-kem-512
+cargo build --release --no-default-features --features ml-kem-1024
 ```
 
 ## Usage
@@ -90,7 +94,7 @@ The encrypted backend (`~/pqfs-backend`) will contain:
 ┌──────────────▼──────────────────────┐
 │  Crypto (src/crypto.rs)             │
 │  - Argon2(password)                 │
-│  - ML-KEM-768 hybrid KEM            │
+│  - ML-KEM hybrid KEM                │
 │  - XChaCha20Poly1305                │
 └─────────────────────────────────────┘
 ```
@@ -102,4 +106,4 @@ The encrypted backend (`~/pqfs-backend`) will contain:
 - [ ] Async / multi-threaded FUSE
 - [ ] Benchmark vs. ext4 / LUKS
 - [ ] Switchable AES-256-GCM vs. ChaCha20-Poly1305
-- [ ] ML-KEM-1024 / ML-KEM-512 parameter option
+- [x] ML-KEM-1024 / ML-KEM-512 parameter option

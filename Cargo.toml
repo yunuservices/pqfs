@@ -7,6 +7,12 @@ description = "A hybrid post-quantum FUSE filesystem in Rust (research prototype
 license = "MIT"
 repository = "https://github.com/yunuservices/pqfs"
 
+[features]
+default = ["ml-kem-768"]
+ml-kem-512 = []
+ml-kem-768 = []
+ml-kem-1024 = []
+
 [dependencies]
 anyhow = "1.0.103"
 argon2 = "0.5.3"

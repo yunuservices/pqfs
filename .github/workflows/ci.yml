@@ -9,8 +9,11 @@ env:
 
 jobs:
   cargo-check:
-    name: Cargo Check
+    name: Cargo Check (${{ matrix.features }})
     runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        features: [ml-kem-768, ml-kem-512, ml-kem-1024]
 
     steps:
       - name: Checkout repository
@@ -28,4 +31,4 @@ jobs:
         uses: Swatinem/rust-cache@v2
 
       - name: Run cargo check
-        run: cargo check --all-targets
+        run: cargo check --all-targets --no-default-features --features ${{ matrix.features }}

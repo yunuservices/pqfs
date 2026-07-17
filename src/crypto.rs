@@ -7,8 +7,8 @@ use chacha20poly1305::aead::{Aead, KeyInit};
 use chacha20poly1305::{Key, XChaCha20Poly1305, XNonce};
 use hkdf::Hkdf;
 use hmac::{Hmac, Mac};
+use ml_kem::Seed;
 use ml_kem::kem::{Ciphertext, Decapsulate, Encapsulate, Kem, KeyExport};
-use ml_kem::{MlKem768, Seed};
 use rand::Rng;
 use serde::{Deserialize, Serialize};
 use sha2::Sha256;
@@ -18,10 +18,40 @@ const SALT_LEN: usize = 16;
 const NONCE_LEN: usize = 24;
 const SEED_LEN: usize = 64;
 
+#[cfg(all(feature = "ml-kem-512", feature = "ml-kem-768"))]
+compile_error!("Only one ML-KEM parameter feature may be enabled at a time.");
+#[cfg(all(feature = "ml-kem-512", feature = "ml-kem-1024"))]
+compile_error!("Only one ML-KEM parameter feature may be enabled at a time.");
+#[cfg(all(feature = "ml-kem-768", feature = "ml-kem-1024"))]
+compile_error!("Only one ML-KEM parameter feature may be enabled at a time.");
+#[cfg(not(any(
+    feature = "ml-kem-512",
+    feature = "ml-kem-768",
+    feature = "ml-kem-1024"
+)))]
+compile_error!(
+    "You must enable one of the ML-KEM parameter features: ml-kem-512, ml-kem-768, or ml-kem-1024."
+);
+
+#[cfg(feature = "ml-kem-512")]
+type SelectedKem = ml_kem::MlKem512;
+#[cfg(feature = "ml-kem-768")]
+type SelectedKem = ml_kem::MlKem768;
+#[cfg(feature = "ml-kem-1024")]
+type SelectedKem = ml_kem::MlKem1024;
+
+#[cfg(feature = "ml-kem-512")]
+const SELECTED_KEM_PARAM: u16 = 512;
+#[cfg(feature = "ml-kem-768")]
+const SELECTED_KEM_PARAM: u16 = 768;
+#[cfg(feature = "ml-kem-1024")]
+const SELECTED_KEM_PARAM: u16 = 1024;
+
 /// On-disk header stored in the backend root.
 #[derive(Serialize, Deserialize, Debug)]
 pub struct VolumeHeader {
     pub salt: [u8; SALT_LEN],
+    pub kem_param: u16,
     pub kem_ciphertext: Vec<u8>,
     pub kem_public_key: Vec<u8>,
     pub encrypted_seed: Vec<u8>,
@@ -38,9 +68,9 @@ pub struct Crypto {
 impl Crypto {
     const HEADER_FILE: &'static str = "pqfs.header";
 
-    /// Create a new volume. Generates an ML-KEM-768 keypair, derives a hybrid
-    /// master key from the password and the KEM shared secret, and stores the
-    /// encrypted seed in the backend.
+    /// Create a new volume. Generates an ML-KEM keypair for the selected
+    /// parameter set, derives a hybrid master key from the password and the KEM
+    /// shared secret, and stores the encrypted seed in the backend.
     pub fn init(password: &str, backend: &Path) -> Result<Self> {
         fs::create_dir_all(backend)?;
         let header_path = backend.join(Self::HEADER_FILE);
@@ -56,7 +86,7 @@ impl Crypto {
             .map_err(|_| anyhow::anyhow!("invalid password key length"))?;
         let pw_cipher = XChaCha20Poly1305::new(&pw_key);
 
-        let (dk, ek) = MlKem768::generate_keypair();
+        let (dk, ek) = <SelectedKem as Kem>::generate_keypair();
         let (ct, shared_secret) = ek.encapsulate();
 
         let seed = dk.to_seed().context("failed to extract ML-KEM seed")?;
@@ -76,6 +106,7 @@ impl Crypto {
 
         let header = VolumeHeader {
             salt,
+            kem_param: SELECTED_KEM_PARAM,
             kem_ciphertext: AsRef::<[u8]>::as_ref(&ct).to_vec(),
             kem_public_key: AsRef::<[u8]>::as_ref(&ek.to_bytes()).to_vec(),
             encrypted_seed: encrypted_seed_blob,
@@ -92,6 +123,13 @@ impl Crypto {
         let data = fs::read(&header_path)
             .with_context(|| format!("failed to read {}", header_path.display()))?;
         let header: VolumeHeader = bincode::deserialize(&data)?;
+        if header.kem_param != SELECTED_KEM_PARAM {
+            bail!(
+                "volume uses ML-KEM-{} but this binary is built for ML-KEM-{}",
+                header.kem_param,
+                SELECTED_KEM_PARAM
+            );
+        }
 
         let password_key = Self::derive_password_key(password, &header.salt)?;
         let pw_key = Key::try_from(password_key.as_slice())
@@ -113,9 +151,9 @@ impl Crypto {
         }
         let seed = Seed::try_from(seed_bytes.as_slice())
             .map_err(|_| anyhow::anyhow!("invalid ML-KEM seed"))?;
-        let dk = <MlKem768 as Kem>::DecapsulationKey::from_seed(seed);
+        let dk = <SelectedKem as Kem>::DecapsulationKey::from_seed(seed);
 
-        let ct_array = Ciphertext::<MlKem768>::try_from(header.kem_ciphertext.as_slice())
+        let ct_array = Ciphertext::<SelectedKem>::try_from(header.kem_ciphertext.as_slice())
             .map_err(|_| anyhow::anyhow!("invalid ML-KEM ciphertext"))?;
         let shared_secret = dk.decapsulate(&ct_array);
 
