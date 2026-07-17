@@ -3,13 +3,12 @@ use std::path::Path;
 
 use anyhow::{Context, Result, bail};
 use argon2::Argon2;
-use chacha20poly1305::aead::{Aead, AeadCore, KeyInit};
+use chacha20poly1305::aead::{Aead, KeyInit};
 use chacha20poly1305::{Key, XChaCha20Poly1305, XNonce};
 use hkdf::Hkdf;
-use ml_kem::kem::{Decapsulate, Encapsulate, Kem, KeyExport};
+use ml_kem::kem::{Ciphertext, Decapsulate, Encapsulate, Generate, Kem, KeyExport};
 use ml_kem::{MlKem768, Seed};
-use rand::RngCore;
-use rand::rngs::OsRng;
+use rand_core::{OsRng, RngCore};
 use serde::{Deserialize, Serialize};
 use sha2::Sha256;
 
@@ -50,11 +49,13 @@ impl Crypto {
         OsRng.fill_bytes(&mut salt);
 
         let password_key = Self::derive_password_key(password, &salt)?;
+        let pw_key = Key::try_from(password_key.as_slice())
+            .map_err(|_| anyhow::anyhow!("invalid password key length"))?;
+        let pw_cipher = XChaCha20Poly1305::new(&pw_key);
 
         let (dk, ek) = MlKem768::generate_keypair();
         let (ct, shared_secret) = ek.encapsulate();
 
-        let pw_cipher = XChaCha20Poly1305::new(Key::from_slice(&password_key));
         let seed = dk.to_seed().context("failed to extract ML-KEM seed")?;
         let seed_bytes: Vec<u8> = seed.as_ref().to_vec();
         let sk_nonce = Self::random_nonce();
@@ -68,12 +69,14 @@ impl Crypto {
         encrypted_seed_blob.extend_from_slice(&encrypted_seed);
 
         let master_key = Self::derive_master_key(&password_key, shared_secret.as_ref())?;
-        let cipher = XChaCha20Poly1305::new(Key::from_slice(&master_key));
+        let master_chacha_key = Key::try_from(master_key.as_slice())
+            .map_err(|_| anyhow::anyhow!("invalid master key length"))?;
+        let cipher = XChaCha20Poly1305::new(&master_chacha_key);
 
         let header = VolumeHeader {
             salt,
             kem_ciphertext: ct.as_ref().to_vec(),
-            kem_public_key: ek.as_bytes().as_ref().to_vec(),
+            kem_public_key: ek.to_bytes().as_ref().to_vec(),
             encrypted_seed: encrypted_seed_blob,
         };
 
@@ -90,14 +93,18 @@ impl Crypto {
         let header: VolumeHeader = bincode::deserialize(&data)?;
 
         let password_key = Self::derive_password_key(password, &header.salt)?;
-        let pw_cipher = XChaCha20Poly1305::new(Key::from_slice(&password_key));
+        let pw_key = Key::try_from(password_key.as_slice())
+            .map_err(|_| anyhow::anyhow!("invalid password key length"))?;
+        let pw_cipher = XChaCha20Poly1305::new(&pw_key);
 
         if header.encrypted_seed.len() < NONCE_LEN + 16 {
             bail!("corrupted encrypted seed");
         }
         let (nonce, ct) = header.encrypted_seed.split_at(NONCE_LEN);
+        let nonce = XNonce::try_from(nonce)
+            .map_err(|_| anyhow::anyhow!("invalid seed nonce length"))?;
         let seed_bytes = pw_cipher
-            .decrypt(XNonce::from_slice(nonce), ct)
+            .decrypt(&nonce, ct)
             .context("password incorrect or corrupted volume")?;
 
         if seed_bytes.len() != SEED_LEN {
@@ -107,12 +114,14 @@ impl Crypto {
             .map_err(|_| anyhow::anyhow!("invalid ML-KEM seed"))?;
         let dk = <MlKem768 as Kem>::DecapsulationKey::from_seed(seed);
 
-        let ct_array = <MlKem768 as Kem>::Ciphertext::try_from(header.kem_ciphertext.as_slice())
+        let ct_array = Ciphertext::<MlKem768>::try_from(header.kem_ciphertext.as_slice())
             .map_err(|_| anyhow::anyhow!("invalid ML-KEM ciphertext"))?;
         let shared_secret = dk.decapsulate(&ct_array);
 
         let master_key = Self::derive_master_key(&password_key, shared_secret.as_ref())?;
-        let cipher = XChaCha20Poly1305::new(Key::from_slice(&master_key));
+        let master_chacha_key = Key::try_from(master_key.as_slice())
+            .map_err(|_| anyhow::anyhow!("invalid master key length"))?;
+        let cipher = XChaCha20Poly1305::new(&master_chacha_key);
 
         Ok(Self { cipher, header })
     }
@@ -136,8 +145,10 @@ impl Crypto {
             bail!("ciphertext too short");
         }
         let (nonce, ct) = blob.split_at(NONCE_LEN);
+        let nonce = XNonce::try_from(nonce)
+            .map_err(|_| anyhow::anyhow!("invalid nonce length"))?;
         self.cipher
-            .decrypt(XNonce::from_slice(nonce), ct)
+            .decrypt(&nonce, ct)
             .context("decryption failed (corrupted or tampered data)")
     }
 
@@ -171,6 +182,6 @@ impl Crypto {
     fn random_nonce() -> XNonce {
         let mut nonce = [0u8; NONCE_LEN];
         OsRng.fill_bytes(&mut nonce);
-        *XNonce::from_slice(&nonce)
+        XNonce::try_from(nonce.as_slice()).expect("nonce length is correct")
     }
 }

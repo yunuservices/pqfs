@@ -19,9 +19,3 @@ pub struct Args {
     #[arg(short = 'o', long = "option")]
     pub options: Vec<String>,
 }
-
-impl Args {
-    pub fn run(self) -> anyhow::Result<()> {
-        crate::fs::mount_fs(self)
-    }
-}

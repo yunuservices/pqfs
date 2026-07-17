@@ -17,7 +17,7 @@ fuser = "0.14"
 hkdf = "0.13.0"
 libc = "0.2.186"
 ml-kem = { version = "0.3.2", features = ["getrandom"] }
-rand = "0.10.2"
+rand_core = "0.10"
 serde = { version = "1.0.228", features = ["derive"] }
 sha2 = "0.11.0"
 tracing = "0.1.44"

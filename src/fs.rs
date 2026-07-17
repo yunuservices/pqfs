@@ -2,10 +2,10 @@ use std::collections::BTreeMap;
 use std::ffi::OsStr;
 use std::fs;
 use std::io;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::time::{Duration, SystemTime};
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result};
 use fuser::{
     FUSE_ROOT_ID, FileAttr, FileType, Filesystem, MountOption, ReplyAttr, ReplyCreate, ReplyData,
     ReplyDirectory, ReplyEmpty, ReplyEntry, ReplyOpen, ReplyWrite, Request,
@@ -248,13 +248,16 @@ impl Filesystem for Pqfs {
         _lock_owner: Option<u64>,
         reply: ReplyWrite,
     ) {
-        let Some(entry) = self.entries.get_mut(&ino) else {
-            reply.error(ENOENT);
-            return;
-        };
-        if !matches!(entry.kind, EntryKind::File) {
-            reply.error(EISDIR);
-            return;
+        match self.entries.get(&ino) {
+            Some(entry) if matches!(entry.kind, EntryKind::File) => {}
+            Some(_) => {
+                reply.error(EISDIR);
+                return;
+            }
+            None => {
+                reply.error(ENOENT);
+                return;
+            }
         }
 
         let data_path = self.data_path(ino);
@@ -303,7 +306,9 @@ impl Filesystem for Pqfs {
             return;
         }
 
-        entry.size = plaintext.len() as u64;
+        if let Some(entry) = self.entries.get_mut(&ino) {
+            entry.size = plaintext.len() as u64;
+        }
         if let Err(e) = self.save_index() {
             error!("index save error: {}", e);
             reply.error(EIO);
@@ -360,6 +365,7 @@ impl Filesystem for Pqfs {
         name: &OsStr,
         mode: u32,
         _umask: u32,
+        _flags: i32,
         reply: ReplyCreate,
     ) {
         if self.find_child(parent, name).is_some() {
