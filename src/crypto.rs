@@ -6,9 +6,10 @@ use argon2::Argon2;
 use chacha20poly1305::aead::{Aead, KeyInit};
 use chacha20poly1305::{Key, XChaCha20Poly1305, XNonce};
 use hkdf::Hkdf;
-use ml_kem::kem::{Ciphertext, Decapsulate, Encapsulate, Generate, Kem, KeyExport};
+use ml_kem::kem::{Ciphertext, Decapsulate, Encapsulate, Kem, KeyExport};
 use ml_kem::{MlKem768, Seed};
-use rand_core::{OsRng, RngCore};
+use rand::Rng;
+use rand::rngs::OsRng;
 use serde::{Deserialize, Serialize};
 use sha2::Sha256;
 
