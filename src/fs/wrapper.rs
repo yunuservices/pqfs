@@ -1,5 +1,5 @@
 use std::ffi::OsStr;
-use std::sync::{Arc, Mutex, mpsc};
+use std::sync::{Arc, Mutex, RwLock, mpsc};
 use std::thread::{self, JoinHandle};
 
 use anyhow::{Context, Result, bail};
@@ -7,24 +7,28 @@ use fuser::{
     Filesystem, MountOption, ReplyAttr, ReplyCreate, ReplyData, ReplyDirectory, ReplyEmpty,
     ReplyEntry, ReplyOpen, ReplyWrite, Request,
 };
+use libc::{EISDIR, ENOENT};
 use tracing::debug;
 
+use super::entry::EntryKind;
 use super::inner::PqfsInner;
 use crate::cli::Args;
 use crate::crypto::Crypto;
 
-/// Thread-pool wrapper around `PqfsInner`. Metadata operations are handled
-/// synchronously; read/write work is offloaded to worker threads so the FUSE
-/// dispatch loop does not block on I/O or crypto.
+/// Thread-pool wrapper around `PqfsInner`. `Crypto` is shared via an `Arc`, and
+/// the metadata lock is held only for short metadata operations. I/O and
+/// crypto work for read/write is offloaded to worker threads so multiple I/O
+/// requests can run concurrently.
 pub struct Pqfs {
-    inner: Arc<Mutex<PqfsInner>>,
+    inner: Arc<RwLock<PqfsInner>>,
+    crypto: Arc<Crypto>,
     job_tx: Option<mpsc::Sender<Box<dyn FnOnce() + Send>>>,
     workers: Vec<JoinHandle<()>>,
 }
 
 impl Pqfs {
-    fn new(inner: PqfsInner) -> Self {
-        let inner = Arc::new(Mutex::new(inner));
+    fn new(inner: PqfsInner, crypto: Arc<Crypto>) -> Self {
+        let inner = Arc::new(RwLock::new(inner));
         let (tx, rx) = mpsc::channel::<Box<dyn FnOnce() + Send>>();
         let rx = Arc::new(Mutex::new(rx));
 
@@ -51,6 +55,7 @@ impl Pqfs {
 
         Self {
             inner,
+            crypto,
             job_tx: Some(tx),
             workers,
         }
@@ -68,9 +73,10 @@ impl Pqfs {
                 args.backend.display()
             );
         };
+        let crypto = Arc::new(crypto);
 
-        let inner = PqfsInner::load(args.backend.clone(), crypto)?;
-        let fs = Self::new(inner);
+        let inner = PqfsInner::load(args.backend.clone(), &crypto)?;
+        let fs = Self::new(inner, Arc::clone(&crypto));
 
         let mut mount_options = vec![
             MountOption::FSName("pqfs".to_string()),
@@ -97,21 +103,20 @@ impl Pqfs {
         Ok(())
     }
 
-    fn lock_inner(&self) -> std::sync::MutexGuard<'_, PqfsInner> {
-        self.inner.lock().unwrap_or_else(|e| e.into_inner())
+    fn read_inner(&self) -> std::sync::RwLockReadGuard<'_, PqfsInner> {
+        self.inner.read().unwrap_or_else(|e| e.into_inner())
+    }
+
+    fn write_inner(&self) -> std::sync::RwLockWriteGuard<'_, PqfsInner> {
+        self.inner.write().unwrap_or_else(|e| e.into_inner())
     }
 
     fn spawn_job<F>(&self, job: F)
     where
-        F: FnOnce(&mut PqfsInner) + Send + 'static,
+        F: FnOnce() + Send + 'static,
     {
-        let inner = Arc::clone(&self.inner);
-        let boxed: Box<dyn FnOnce() + Send> = Box::new(move || {
-            let mut guard = inner.lock().unwrap_or_else(|e| e.into_inner());
-            job(&mut guard);
-        });
         if let Some(tx) = &self.job_tx {
-            let _ = tx.send(boxed);
+            let _ = tx.send(Box::new(job));
         }
     }
 }
@@ -128,11 +133,13 @@ impl Drop for Pqfs {
 
 impl Filesystem for Pqfs {
     fn lookup(&mut self, _req: &Request<'_>, parent: u64, name: &OsStr, reply: ReplyEntry) {
-        self.lock_inner().lookup(parent, name, reply);
+        let crypto = self.crypto.as_ref();
+        self.read_inner().lookup(crypto, parent, name, reply);
     }
 
     fn getattr(&mut self, _req: &Request<'_>, ino: u64, reply: ReplyAttr) {
-        self.lock_inner().getattr(ino, reply);
+        let crypto = self.crypto.as_ref();
+        self.read_inner().getattr(crypto, ino, reply);
     }
 
     fn read(
@@ -146,9 +153,25 @@ impl Filesystem for Pqfs {
         _lock_owner: Option<u64>,
         reply: ReplyData,
     ) {
-        self.spawn_job(move |inner| {
-            inner.do_read(ino, offset, size, reply);
-        });
+        let inner = Arc::clone(&self.inner);
+        let crypto = Arc::clone(&self.crypto);
+
+        let (entry, data_path) = {
+            let inner = self.read_inner();
+            let entry = inner.entries.get(&ino).cloned();
+            let data_path = inner.data_path(ino);
+            (entry, data_path)
+        };
+
+        match entry {
+            Some(entry) if matches!(entry.kind, EntryKind::File) => {
+                self.spawn_job(move || {
+                    PqfsInner::do_read(crypto.as_ref(), &entry, data_path, offset, size, reply);
+                });
+            }
+            Some(_) => reply.error(EISDIR),
+            None => reply.error(ENOENT),
+        }
     }
 
     fn write(
@@ -164,9 +187,40 @@ impl Filesystem for Pqfs {
         reply: ReplyWrite,
     ) {
         let data = data.to_vec();
-        self.spawn_job(move |inner| {
-            inner.do_write(ino, offset, &data, reply);
-        });
+        let inner = Arc::clone(&self.inner);
+        let crypto = Arc::clone(&self.crypto);
+
+        let (entry, data_path) = {
+            let inner = self.read_inner();
+            let entry = inner.entries.get(&ino).cloned();
+            let data_path = inner.data_path(ino);
+            (entry, data_path)
+        };
+
+        match entry {
+            Some(entry) if matches!(entry.kind, EntryKind::File) => {
+                self.spawn_job(move || {
+                    let (content_key_enc, size) = match PqfsInner::do_write_data(
+                        crypto.as_ref(),
+                        &entry,
+                        data_path,
+                        offset,
+                        &data,
+                    ) {
+                        Ok(v) => v,
+                        Err(code) => {
+                            reply.error(code);
+                            return;
+                        }
+                    };
+                    let written = data.len() as u32;
+                    let mut inner = inner.write().unwrap_or_else(|e| e.into_inner());
+                    inner.commit_write(crypto.as_ref(), ino, content_key_enc, size, reply, written);
+                });
+            }
+            Some(_) => reply.error(EISDIR),
+            None => reply.error(ENOENT),
+        }
     }
 
     fn readdir(
@@ -177,7 +231,8 @@ impl Filesystem for Pqfs {
         offset: i64,
         reply: ReplyDirectory,
     ) {
-        self.lock_inner().readdir(ino, offset, reply);
+        let crypto = self.crypto.as_ref();
+        self.read_inner().readdir(crypto, ino, offset, reply);
     }
 
     fn create(
@@ -190,7 +245,8 @@ impl Filesystem for Pqfs {
         _flags: i32,
         reply: ReplyCreate,
     ) {
-        self.lock_inner().create(parent, name, mode, reply);
+        let crypto = self.crypto.as_ref();
+        self.write_inner().create(crypto, parent, name, mode, reply);
     }
 
     fn mkdir(
@@ -202,19 +258,22 @@ impl Filesystem for Pqfs {
         _umask: u32,
         reply: ReplyEntry,
     ) {
-        self.lock_inner().mkdir(parent, name, mode, reply);
+        let crypto = self.crypto.as_ref();
+        self.write_inner().mkdir(crypto, parent, name, mode, reply);
     }
 
     fn unlink(&mut self, _req: &Request<'_>, parent: u64, name: &OsStr, reply: ReplyEmpty) {
-        self.lock_inner().unlink(parent, name, reply);
+        let crypto = self.crypto.as_ref();
+        self.write_inner().unlink(crypto, parent, name, reply);
     }
 
     fn rmdir(&mut self, _req: &Request<'_>, parent: u64, name: &OsStr, reply: ReplyEmpty) {
-        self.lock_inner().rmdir(parent, name, reply);
+        let crypto = self.crypto.as_ref();
+        self.write_inner().rmdir(crypto, parent, name, reply);
     }
 
     fn open(&mut self, _req: &Request<'_>, ino: u64, _flags: i32, reply: ReplyOpen) {
-        self.lock_inner().open(ino, reply);
+        self.read_inner().open(ino, reply);
     }
 
     fn release(
@@ -227,6 +286,6 @@ impl Filesystem for Pqfs {
         _flush: bool,
         reply: ReplyEmpty,
     ) {
-        self.lock_inner().release(reply);
+        PqfsInner::release(reply);
     }
 }

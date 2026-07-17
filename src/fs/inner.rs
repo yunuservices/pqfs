@@ -11,18 +11,16 @@ use super::entry::{Entry, EntryKind};
 use super::{BLOCK_SIZE, INDEX_FILE};
 use crate::crypto::Crypto;
 
-/// The actual filesystem state. Mutated under an `Arc<Mutex<...>>` so that
-/// long-running I/O operations can be offloaded to worker threads without
-/// blocking the FUSE dispatch loop.
+/// The actual filesystem metadata state. It is decoupled from `Crypto` so
+/// long-running I/O and crypto work does not have to hold the metadata lock.
 pub(crate) struct PqfsInner {
     pub(crate) backend: PathBuf,
-    pub(crate) crypto: Crypto,
     pub(crate) entries: BTreeMap<u64, Entry>,
     pub(crate) next_ino: u64,
 }
 
 impl PqfsInner {
-    pub(crate) fn load(backend: PathBuf, crypto: Crypto) -> Result<Self> {
+    pub(crate) fn load(backend: PathBuf, crypto: &Crypto) -> Result<Self> {
         fs::create_dir_all(&backend)?;
         fs::create_dir_all(backend.join("data"))?;
 
@@ -60,15 +58,14 @@ impl PqfsInner {
 
         Ok(Self {
             backend,
-            crypto,
             entries,
             next_ino,
         })
     }
 
-    pub(crate) fn save_index(&mut self) -> Result<()> {
+    pub(crate) fn save_index(&mut self, crypto: &Crypto) -> Result<()> {
         let plaintext = bincode::serialize(&self.entries)?;
-        let ciphertext = self.crypto.encrypt(&plaintext)?;
+        let ciphertext = crypto.encrypt(&plaintext)?;
         let index_path = self.backend.join(INDEX_FILE);
         let tmp = index_path.with_extension("tmp");
         fs::write(&tmp, ciphertext)?;
@@ -104,10 +101,9 @@ impl PqfsInner {
         self.backend.join("data").join(format!("{}", ino))
     }
 
-    pub(crate) fn find_child(&self, parent: u64, name: &OsStr) -> Option<&Entry> {
+    pub(crate) fn find_child(&self, crypto: &Crypto, parent: u64, name: &OsStr) -> Option<&Entry> {
         let name = name.to_string_lossy();
-        let hash = self.crypto.hash_filename(&name);
-        let crypto = &self.crypto;
+        let hash = crypto.hash_filename(&name);
         self.entries.values().find(|e| {
             if e.parent != parent || e.name_hash != hash {
                 return false;

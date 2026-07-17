@@ -1,10 +1,11 @@
 use std::ffi::OsStr;
 use std::fs;
 use std::io;
+use std::path::PathBuf;
 
 use fuser::{
-    FileType, Filesystem, ReplyAttr, ReplyCreate, ReplyData, ReplyDirectory, ReplyEmpty,
-    ReplyEntry, ReplyOpen, ReplyWrite, Request,
+    FileType, ReplyAttr, ReplyCreate, ReplyData, ReplyDirectory, ReplyEmpty, ReplyEntry, ReplyOpen,
+    ReplyWrite,
 };
 use libc::{EEXIST, EIO, EISDIR, ENOENT, ENOTDIR, ENOTEMPTY};
 use tracing::{error, warn};
@@ -12,17 +13,18 @@ use tracing::{error, warn};
 use super::TTL;
 use super::entry::{Entry, EntryKind};
 use super::inner::PqfsInner;
+use crate::crypto::Crypto;
 
 impl PqfsInner {
-    pub(crate) fn lookup(&mut self, parent: u64, name: &OsStr, reply: ReplyEntry) {
-        if let Some(entry) = self.find_child(parent, name).cloned() {
+    pub(crate) fn lookup(&self, crypto: &Crypto, parent: u64, name: &OsStr, reply: ReplyEntry) {
+        if let Some(entry) = self.find_child(crypto, parent, name).cloned() {
             reply.entry(&TTL, &self.attr_for(&entry), 0);
         } else {
             reply.error(ENOENT);
         }
     }
 
-    pub(crate) fn getattr(&mut self, ino: u64, reply: ReplyAttr) {
+    pub(crate) fn getattr(&self, crypto: &Crypto, ino: u64, reply: ReplyAttr) {
         if let Some(entry) = self.entries.get(&ino).cloned() {
             reply.attr(&TTL, &self.attr_for(&entry));
         } else {
@@ -31,18 +33,16 @@ impl PqfsInner {
     }
 
     /// Synchronous counterpart of `Filesystem::read`, callable from worker
-    /// threads that do not hold a `fuser::Request` reference.
-    pub(crate) fn do_read(&mut self, ino: u64, offset: i64, size: u32, reply: ReplyData) {
-        let Some(entry) = self.entries.get(&ino).cloned() else {
-            reply.error(ENOENT);
-            return;
-        };
-        if !matches!(entry.kind, EntryKind::File) {
-            reply.error(EISDIR);
-            return;
-        }
-
-        let data_path = self.data_path(ino);
+    /// threads. No `&self` is required because the caller already extracted the
+    /// entry snapshot and data path while holding only a brief read lock.
+    pub(crate) fn do_read(
+        crypto: &Crypto,
+        entry: &Entry,
+        data_path: PathBuf,
+        offset: i64,
+        size: u32,
+        reply: ReplyData,
+    ) {
         let ciphertext = match fs::read(&data_path) {
             Ok(v) => v,
             Err(e) if e.kind() == io::ErrorKind::NotFound => {
@@ -56,39 +56,11 @@ impl PqfsInner {
             }
         };
 
-        let plaintext = if entry.content_key.is_empty() {
-            // Legacy file: content encrypted directly with the master key.
-            match self.crypto.decrypt(&ciphertext) {
-                Ok(v) => v,
-                Err(e) => {
-                    error!("decrypt error for inode {}: {}", ino, e);
-                    reply.error(EIO);
-                    return;
-                }
-            }
-        } else {
-            let content_key = match self.crypto.decrypt(&entry.content_key) {
-                Ok(v) => {
-                    if v.len() != 32 {
-                        error!("bad per-file key length for inode {}: {}", ino, v.len());
-                        reply.error(EIO);
-                        return;
-                    }
-                    v
-                }
-                Err(e) => {
-                    error!("content key decrypt error for inode {}: {}", ino, e);
-                    reply.error(EIO);
-                    return;
-                }
-            };
-            match self.crypto.decrypt_with_key(&content_key, &ciphertext) {
-                Ok(v) => v,
-                Err(e) => {
-                    error!("decrypt error for inode {}: {}", ino, e);
-                    reply.error(EIO);
-                    return;
-                }
+        let plaintext = match decrypt_file_content(crypto, entry, &ciphertext) {
+            Ok(v) => v,
+            Err(code) => {
+                reply.error(code);
+                return;
             }
         };
 
@@ -97,101 +69,55 @@ impl PqfsInner {
         reply.data(&plaintext[offset..end]);
     }
 
-    /// Synchronous counterpart of `Filesystem::write`, callable from worker
-    /// threads that do not hold a `fuser::Request` reference.
-    pub(crate) fn do_write(&mut self, ino: u64, offset: i64, data: &[u8], reply: ReplyWrite) {
-        let mut entry = match self.entries.get(&ino).cloned() {
-            Some(e) if matches!(e.kind, EntryKind::File) => e,
-            Some(_) => {
-                reply.error(EISDIR);
-                return;
-            }
-            None => {
-                reply.error(ENOENT);
-                return;
+    /// Read the existing plaintext for a file write. Performed outside the
+    /// metadata lock so that long-running I/O and crypto do not block other
+    /// operations.
+    pub(crate) fn read_existing_plaintext(
+        crypto: &Crypto,
+        entry: &Entry,
+        data_path: PathBuf,
+    ) -> Result<Vec<u8>, i32> {
+        if !data_path.exists() {
+            return Ok(Vec::new());
+        }
+        let ciphertext = match fs::read(&data_path) {
+            Ok(v) => v,
+            Err(e) => {
+                error!("read error on write for {}: {}", data_path.display(), e);
+                return Err(EIO);
             }
         };
+        decrypt_file_content(crypto, entry, &ciphertext)
+    }
 
-        let data_path = self.data_path(ino);
-        let mut plaintext = if data_path.exists() {
-            match fs::read(&data_path) {
-                Ok(ct) => {
-                    if entry.content_key.is_empty() {
-                        // Legacy file: decrypt with the master key and convert below.
-                        match self.crypto.decrypt(&ct) {
-                            Ok(pt) => pt,
-                            Err(e) => {
-                                error!("decrypt error on write for {}: {}", data_path.display(), e);
-                                reply.error(EIO);
-                                return;
-                            }
-                        }
-                    } else {
-                        let content_key = match self.crypto.decrypt(&entry.content_key) {
-                            Ok(v) => {
-                                if v.len() != 32 {
-                                    error!("bad per-file key length for inode {}", ino);
-                                    reply.error(EIO);
-                                    return;
-                                }
-                                v
-                            }
-                            Err(e) => {
-                                error!("content key decrypt error for inode {}: {}", ino, e);
-                                reply.error(EIO);
-                                return;
-                            }
-                        };
-                        match self.crypto.decrypt_with_key(&content_key, &ct) {
-                            Ok(pt) => pt,
-                            Err(e) => {
-                                error!("decrypt error on write for {}: {}", data_path.display(), e);
-                                reply.error(EIO);
-                                return;
-                            }
-                        }
-                    }
-                }
+    /// Encrypt and write the plaintext for a file write. Returns the
+    /// (possibly new) encrypted per-file content key and the final size so the
+    /// caller can update metadata under a short write lock.
+    pub(crate) fn do_write_data(
+        crypto: &Crypto,
+        entry: &Entry,
+        data_path: PathBuf,
+        offset: i64,
+        data: &[u8],
+    ) -> Result<(Vec<u8>, u64), i32> {
+        let mut plaintext = Self::read_existing_plaintext(crypto, entry, data_path.clone())?;
+
+        // Ensure this file has its own per-file key.
+        let content_key_enc = if entry.content_key.is_empty() {
+            match crypto.encrypt(&crypto.random_key()) {
+                Ok(v) => v,
                 Err(e) => {
-                    error!("read error on write for {}: {}", data_path.display(), e);
-                    reply.error(EIO);
-                    return;
+                    error!("content key encrypt error for inode {}: {}", entry.ino, e);
+                    return Err(EIO);
                 }
             }
         } else {
-            Vec::new()
+            entry.content_key.clone()
         };
 
-        // Ensure this file has its own per-file key.
-        if entry.content_key.is_empty() {
-            let key = self.crypto.random_key();
-            match self.crypto.encrypt(&key) {
-                Ok(v) => entry.content_key = v,
-                Err(e) => {
-                    error!("content key encrypt error for inode {}: {}", ino, e);
-                    reply.error(EIO);
-                    return;
-                }
-            }
-            if let Some(e) = self.entries.get_mut(&ino) {
-                e.content_key = entry.content_key.clone();
-            }
-        }
-
-        let content_key = match self.crypto.decrypt(&entry.content_key) {
-            Ok(v) => {
-                if v.len() != 32 {
-                    error!("bad per-file key length for inode {}", ino);
-                    reply.error(EIO);
-                    return;
-                }
-                v
-            }
-            Err(e) => {
-                error!("content key decrypt error for inode {}: {}", ino, e);
-                reply.error(EIO);
-                return;
-            }
+        let content_key = match decrypt_content_key(crypto, &content_key_enc, entry.ino) {
+            Ok(v) => v,
+            Err(code) => return Err(code),
         };
 
         let offset = offset as usize;
@@ -204,34 +130,29 @@ impl PqfsInner {
         }
         plaintext[offset..end].copy_from_slice(data);
 
-        let ciphertext = match self.crypto.encrypt_with_key(&content_key, &plaintext) {
+        let ciphertext = match crypto.encrypt_with_key(&content_key, &plaintext) {
             Ok(v) => v,
             Err(e) => {
                 error!("encrypt error for {}: {}", data_path.display(), e);
-                reply.error(EIO);
-                return;
+                return Err(EIO);
             }
         };
 
         if let Err(e) = fs::write(&data_path, ciphertext) {
             error!("write error for {}: {}", data_path.display(), e);
-            reply.error(EIO);
-            return;
+            return Err(EIO);
         }
 
-        if let Some(e) = self.entries.get_mut(&ino) {
-            e.size = plaintext.len() as u64;
-        }
-        if let Err(e) = self.save_index() {
-            error!("index save error: {}", e);
-            reply.error(EIO);
-            return;
-        }
-
-        reply.written(data.len() as u32);
+        Ok((content_key_enc, plaintext.len() as u64))
     }
 
-    pub(crate) fn readdir(&mut self, ino: u64, offset: i64, mut reply: ReplyDirectory) {
+    pub(crate) fn readdir(
+        &self,
+        crypto: &Crypto,
+        ino: u64,
+        offset: i64,
+        mut reply: ReplyDirectory,
+    ) {
         let Some(parent) = self.entries.get(&ino).cloned() else {
             reply.error(ENOENT);
             return;
@@ -245,7 +166,6 @@ impl PqfsInner {
             (ino, FileType::Directory, ".".to_string()),
             (parent.parent, FileType::Directory, "..".to_string()),
         ];
-        let crypto = &self.crypto;
         for child in self.entries.values().filter(|e| e.parent == ino) {
             let name = match crypto.decrypt_filename(&child.name_encrypted) {
                 Ok(n) => n,
@@ -273,16 +193,23 @@ impl PqfsInner {
         reply.ok();
     }
 
-    pub(crate) fn create(&mut self, parent: u64, name: &OsStr, mode: u32, reply: ReplyCreate) {
-        if self.find_child(parent, name).is_some() {
+    pub(crate) fn create(
+        &mut self,
+        crypto: &Crypto,
+        parent: u64,
+        name: &OsStr,
+        mode: u32,
+        reply: ReplyCreate,
+    ) {
+        if self.find_child(crypto, parent, name).is_some() {
             reply.error(EEXIST);
             return;
         }
 
         let ino = self.allocate_ino();
         let name = name.to_string_lossy().to_string();
-        let name_hash = self.crypto.hash_filename(&name);
-        let name_encrypted = match self.crypto.encrypt_filename(&name) {
+        let name_hash = crypto.hash_filename(&name);
+        let name_encrypted = match crypto.encrypt_filename(&name) {
             Ok(v) => v,
             Err(e) => {
                 error!("filename encryption error: {}", e);
@@ -290,7 +217,7 @@ impl PqfsInner {
                 return;
             }
         };
-        let content_key = match self.crypto.encrypt(&self.crypto.random_key()) {
+        let content_key = match crypto.encrypt(&crypto.random_key()) {
             Ok(v) => v,
             Err(e) => {
                 error!("content key encryption error: {}", e);
@@ -312,7 +239,7 @@ impl PqfsInner {
         };
 
         self.entries.insert(ino, entry.clone());
-        if let Err(e) = self.save_index() {
+        if let Err(e) = self.save_index(crypto) {
             error!("index save error: {}", e);
             reply.error(EIO);
             return;
@@ -321,16 +248,23 @@ impl PqfsInner {
         reply.created(&TTL, &self.attr_for(&entry), 0, 0, 0);
     }
 
-    pub(crate) fn mkdir(&mut self, parent: u64, name: &OsStr, mode: u32, reply: ReplyEntry) {
-        if self.find_child(parent, name).is_some() {
+    pub(crate) fn mkdir(
+        &mut self,
+        crypto: &Crypto,
+        parent: u64,
+        name: &OsStr,
+        mode: u32,
+        reply: ReplyEntry,
+    ) {
+        if self.find_child(crypto, parent, name).is_some() {
             reply.error(EEXIST);
             return;
         }
 
         let ino = self.allocate_ino();
         let name = name.to_string_lossy().to_string();
-        let name_hash = self.crypto.hash_filename(&name);
-        let name_encrypted = match self.crypto.encrypt_filename(&name) {
+        let name_hash = crypto.hash_filename(&name);
+        let name_encrypted = match crypto.encrypt_filename(&name) {
             Ok(v) => v,
             Err(e) => {
                 error!("filename encryption error: {}", e);
@@ -352,7 +286,7 @@ impl PqfsInner {
         };
 
         self.entries.insert(ino, entry.clone());
-        if let Err(e) = self.save_index() {
+        if let Err(e) = self.save_index(crypto) {
             error!("index save error: {}", e);
             reply.error(EIO);
             return;
@@ -361,8 +295,8 @@ impl PqfsInner {
         reply.entry(&TTL, &self.attr_for(&entry), 0);
     }
 
-    pub(crate) fn unlink(&mut self, parent: u64, name: &OsStr, reply: ReplyEmpty) {
-        let Some(entry) = self.find_child(parent, name).cloned() else {
+    pub(crate) fn unlink(&mut self, crypto: &Crypto, parent: u64, name: &OsStr, reply: ReplyEmpty) {
+        let Some(entry) = self.find_child(crypto, parent, name).cloned() else {
             reply.error(ENOENT);
             return;
         };
@@ -374,7 +308,7 @@ impl PqfsInner {
         {
             warn!("failed to remove data file {}: {}", data_path.display(), e);
         }
-        if let Err(e) = self.save_index() {
+        if let Err(e) = self.save_index(crypto) {
             error!("index save error: {}", e);
             reply.error(EIO);
             return;
@@ -382,8 +316,8 @@ impl PqfsInner {
         reply.ok();
     }
 
-    pub(crate) fn rmdir(&mut self, parent: u64, name: &OsStr, reply: ReplyEmpty) {
-        let Some(entry) = self.find_child(parent, name).cloned() else {
+    pub(crate) fn rmdir(&mut self, crypto: &Crypto, parent: u64, name: &OsStr, reply: ReplyEmpty) {
+        let Some(entry) = self.find_child(crypto, parent, name).cloned() else {
             reply.error(ENOENT);
             return;
         };
@@ -397,7 +331,7 @@ impl PqfsInner {
         }
 
         self.entries.remove(&entry.ino);
-        if let Err(e) = self.save_index() {
+        if let Err(e) = self.save_index(crypto) {
             error!("index save error: {}", e);
             reply.error(EIO);
             return;
@@ -405,7 +339,7 @@ impl PqfsInner {
         reply.ok();
     }
 
-    pub(crate) fn open(&mut self, ino: u64, reply: ReplyOpen) {
+    pub(crate) fn open(&self, ino: u64, reply: ReplyOpen) {
         if self.entries.contains_key(&ino) {
             reply.opened(0, 0);
         } else {
@@ -413,107 +347,83 @@ impl PqfsInner {
         }
     }
 
-    pub(crate) fn release(&mut self, reply: ReplyEmpty) {
+    pub(crate) fn release(reply: ReplyEmpty) {
         reply.ok();
+    }
+
+    /// Return a file entry snapshot to be used outside the metadata lock.
+    pub(crate) fn file_entry(&self, ino: u64) -> Option<Entry> {
+        self.entries
+            .get(&ino)
+            .filter(|e| matches!(e.kind, EntryKind::File))
+            .cloned()
+    }
+
+    /// Update the metadata after a write has completed on disk.
+    pub(crate) fn commit_write(
+        &mut self,
+        crypto: &Crypto,
+        ino: u64,
+        content_key_enc: Vec<u8>,
+        size: u64,
+        reply: ReplyWrite,
+        written: u32,
+    ) {
+        if let Some(e) = self.entries.get_mut(&ino) {
+            e.content_key = content_key_enc;
+            e.size = size;
+        } else {
+            // Entry was removed while the write was in flight. The data file
+            // is already on disk; report success because the write completed.
+            warn!(
+                "inode {} removed during write; orphan data file may remain",
+                ino
+            );
+        }
+        if let Err(e) = self.save_index(crypto) {
+            error!("index save error: {}", e);
+            reply.error(EIO);
+            return;
+        }
+        reply.written(written);
     }
 }
 
-impl Filesystem for PqfsInner {
-    fn lookup(&mut self, _req: &Request<'_>, parent: u64, name: &OsStr, reply: ReplyEntry) {
-        self.lookup(parent, name, reply);
+fn decrypt_content_key(crypto: &Crypto, content_key_enc: &[u8], ino: u64) -> Result<Vec<u8>, i32> {
+    match crypto.decrypt(content_key_enc) {
+        Ok(v) => {
+            if v.len() != 32 {
+                error!("bad per-file key length for inode {}: {}", ino, v.len());
+                Err(EIO)
+            } else {
+                Ok(v)
+            }
+        }
+        Err(e) => {
+            error!("content key decrypt error for inode {}: {}", ino, e);
+            Err(EIO)
+        }
     }
+}
 
-    fn getattr(&mut self, _req: &Request<'_>, ino: u64, reply: ReplyAttr) {
-        self.getattr(ino, reply);
-    }
-
-    fn read(
-        &mut self,
-        _req: &Request<'_>,
-        ino: u64,
-        _fh: u64,
-        offset: i64,
-        size: u32,
-        _flags: i32,
-        _lock_owner: Option<u64>,
-        reply: ReplyData,
-    ) {
-        self.do_read(ino, offset, size, reply);
-    }
-
-    fn write(
-        &mut self,
-        _req: &Request<'_>,
-        ino: u64,
-        _fh: u64,
-        offset: i64,
-        data: &[u8],
-        _write_flags: u32,
-        _flags: i32,
-        _lock_owner: Option<u64>,
-        reply: ReplyWrite,
-    ) {
-        self.do_write(ino, offset, data, reply);
-    }
-
-    fn readdir(
-        &mut self,
-        _req: &Request<'_>,
-        ino: u64,
-        _fh: u64,
-        offset: i64,
-        reply: ReplyDirectory,
-    ) {
-        self.readdir(ino, offset, reply);
-    }
-
-    fn create(
-        &mut self,
-        _req: &Request<'_>,
-        parent: u64,
-        name: &OsStr,
-        mode: u32,
-        _umask: u32,
-        _flags: i32,
-        reply: ReplyCreate,
-    ) {
-        self.create(parent, name, mode, reply);
-    }
-
-    fn mkdir(
-        &mut self,
-        _req: &Request<'_>,
-        parent: u64,
-        name: &OsStr,
-        mode: u32,
-        _umask: u32,
-        reply: ReplyEntry,
-    ) {
-        self.mkdir(parent, name, mode, reply);
-    }
-
-    fn unlink(&mut self, _req: &Request<'_>, parent: u64, name: &OsStr, reply: ReplyEmpty) {
-        self.unlink(parent, name, reply);
-    }
-
-    fn rmdir(&mut self, _req: &Request<'_>, parent: u64, name: &OsStr, reply: ReplyEmpty) {
-        self.rmdir(parent, name, reply);
-    }
-
-    fn open(&mut self, _req: &Request<'_>, ino: u64, _flags: i32, reply: ReplyOpen) {
-        self.open(ino, reply);
-    }
-
-    fn release(
-        &mut self,
-        _req: &Request<'_>,
-        _ino: u64,
-        _fh: u64,
-        _flags: i32,
-        _lock_owner: Option<u64>,
-        _flush: bool,
-        reply: ReplyEmpty,
-    ) {
-        self.release(reply);
+fn decrypt_file_content(crypto: &Crypto, entry: &Entry, ciphertext: &[u8]) -> Result<Vec<u8>, i32> {
+    if entry.content_key.is_empty() {
+        // Legacy file: content encrypted directly with the master key.
+        match crypto.decrypt(ciphertext) {
+            Ok(v) => Ok(v),
+            Err(e) => {
+                error!("decrypt error for inode {}: {}", entry.ino, e);
+                Err(EIO)
+            }
+        }
+    } else {
+        let content_key = decrypt_content_key(crypto, &entry.content_key, entry.ino)?;
+        match crypto.decrypt_with_key(&content_key, ciphertext) {
+            Ok(v) => Ok(v),
+            Err(e) => {
+                error!("decrypt error for inode {}: {}", entry.ino, e);
+                Err(EIO)
+            }
+        }
     }
 }
