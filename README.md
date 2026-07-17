@@ -14,7 +14,7 @@ A hybrid post-quantum FUSE filesystem written in Rust.
 
 - FUSE userspace filesystem in Rust (`fuser`)
 - Hybrid key derivation: Argon2(password) + ML-KEM-768 shared secret
-- Authenticated encryption for file contents and directory index (XChaCha20Poly1305)
+- Authenticated encryption for file contents, directory index, and file names (XChaCha20Poly1305)
 - Small, modular codebase suitable for learning and extending
 - CLI with mount options
 
@@ -95,7 +95,7 @@ The encrypted backend (`~/pqfs-backend`) will contain:
 
 ## Roadmap / Ideas
 
-- [ ] File-name encryption
+- [x] File-name encryption
 - [ ] Per-file keys instead of one master key
 - [ ] Async / multi-threaded FUSE
 - [ ] Benchmark vs. ext4 / LUKS

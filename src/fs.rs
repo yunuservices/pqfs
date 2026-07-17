@@ -31,7 +31,8 @@ enum EntryKind {
 struct Entry {
     ino: u64,
     parent: u64,
-    name: String,
+    name_hash: [u8; 32],
+    name_encrypted: Vec<u8>,
     kind: EntryKind,
     size: u64,
     perm: u16,
@@ -95,12 +96,15 @@ impl Pqfs {
             (map, next_ino)
         } else {
             let mut map = BTreeMap::new();
+            let root_hash = crypto.hash_filename("");
+            let root_name = crypto.encrypt_filename("").context("failed to encrypt root name")?;
             map.insert(
                 FUSE_ROOT_ID,
                 Entry {
                     ino: FUSE_ROOT_ID,
                     parent: FUSE_ROOT_ID,
-                    name: "".to_string(),
+                    name_hash: root_hash,
+                    name_encrypted: root_name,
                     kind: EntryKind::Dir,
                     size: 0,
                     perm: 0o755,
@@ -159,9 +163,18 @@ impl Pqfs {
 
     fn find_child(&self, parent: u64, name: &OsStr) -> Option<&Entry> {
         let name = name.to_string_lossy();
-        self.entries
-            .values()
-            .find(|e| e.parent == parent && e.name == name.as_ref())
+        let hash = self.crypto.hash_filename(&name);
+        let crypto = &self.crypto;
+        self.entries.values().find(|e| {
+            if e.parent != parent || e.name_hash != hash {
+                return false;
+            }
+            // Verify with decryption to rule out hash collisions.
+            crypto
+                .decrypt_filename(&e.name_encrypted)
+                .map(|decrypted| decrypted == name.as_ref())
+                .unwrap_or(false)
+        })
     }
 
     fn allocate_ino(&mut self) -> u64 {
@@ -339,14 +352,23 @@ impl Filesystem for Pqfs {
             (ino, FileType::Directory, ".".to_string()),
             (parent.parent, FileType::Directory, "..".to_string()),
         ];
+        let crypto = &self.crypto;
         for child in self.entries.values().filter(|e| e.parent == ino) {
+            let name = match crypto.decrypt_filename(&child.name_encrypted) {
+                Ok(n) => n,
+                Err(e) => {
+                    error!("filename decryption error for inode {}: {}", child.ino, e);
+                    reply.error(EIO);
+                    return;
+                }
+            };
             entries.push((
                 child.ino,
                 match child.kind {
                     EntryKind::File => FileType::RegularFile,
                     EntryKind::Dir => FileType::Directory,
                 },
-                child.name.clone(),
+                name,
             ));
         }
 
@@ -375,10 +397,20 @@ impl Filesystem for Pqfs {
 
         let ino = self.allocate_ino();
         let name = name.to_string_lossy().to_string();
+        let name_hash = self.crypto.hash_filename(&name);
+        let name_encrypted = match self.crypto.encrypt_filename(&name) {
+            Ok(v) => v,
+            Err(e) => {
+                error!("filename encryption error: {}", e);
+                reply.error(EIO);
+                return;
+            }
+        };
         let entry = Entry {
             ino,
             parent,
-            name,
+            name_hash,
+            name_encrypted,
             kind: EntryKind::File,
             size: 0,
             perm: (mode as u16) & 0o777,
@@ -411,10 +443,21 @@ impl Filesystem for Pqfs {
         }
 
         let ino = self.allocate_ino();
+        let name = name.to_string_lossy().to_string();
+        let name_hash = self.crypto.hash_filename(&name);
+        let name_encrypted = match self.crypto.encrypt_filename(&name) {
+            Ok(v) => v,
+            Err(e) => {
+                error!("filename encryption error: {}", e);
+                reply.error(EIO);
+                return;
+            }
+        };
         let entry = Entry {
             ino,
             parent,
-            name: name.to_string_lossy().to_string(),
+            name_hash,
+            name_encrypted,
             kind: EntryKind::Dir,
             size: 0,
             perm: (mode as u16) & 0o777,

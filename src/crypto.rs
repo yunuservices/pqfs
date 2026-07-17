@@ -6,6 +6,7 @@ use argon2::Argon2;
 use chacha20poly1305::aead::{Aead, KeyInit};
 use chacha20poly1305::{Key, XChaCha20Poly1305, XNonce};
 use hkdf::Hkdf;
+use hmac::{Hmac, Mac};
 use ml_kem::kem::{Ciphertext, Decapsulate, Encapsulate, Kem, KeyExport};
 use ml_kem::{MlKem768, Seed};
 use rand::Rng;
@@ -30,6 +31,8 @@ pub struct VolumeHeader {
 pub struct Crypto {
     cipher: XChaCha20Poly1305,
     header: VolumeHeader,
+    filename_cipher: XChaCha20Poly1305,
+    filename_hash_key: [u8; KEY_LEN],
 }
 
 impl Crypto {
@@ -72,9 +75,6 @@ impl Crypto {
             &password_key,
             AsRef::<[u8]>::as_ref(&shared_secret),
         )?;
-        let master_chacha_key = Key::try_from(master_key.as_slice())
-            .map_err(|_| anyhow::anyhow!("invalid master key length"))?;
-        let cipher = XChaCha20Poly1305::new(&master_chacha_key);
 
         let header = VolumeHeader {
             salt,
@@ -83,7 +83,7 @@ impl Crypto {
             encrypted_seed: encrypted_seed_blob,
         };
 
-        let this = Self { cipher, header };
+        let this = Self::from_master_key(&master_key, header)?;
         this.save(backend)?;
         Ok(this)
     }
@@ -125,11 +125,8 @@ impl Crypto {
             &password_key,
             AsRef::<[u8]>::as_ref(&shared_secret),
         )?;
-        let master_chacha_key = Key::try_from(master_key.as_slice())
-            .map_err(|_| anyhow::anyhow!("invalid master key length"))?;
-        let cipher = XChaCha20Poly1305::new(&master_chacha_key);
 
-        Ok(Self { cipher, header })
+        Ok(Self::from_master_key(&master_key, header)?)
     }
 
     /// Encrypt arbitrary plaintext. Format: [24-byte nonce || ciphertext || tag].
@@ -183,6 +180,70 @@ impl Crypto {
         hkdf.expand(b"pqfs-hybrid-master-key", &mut okm)
             .map_err(|e| anyhow::anyhow!("HKDF expand failed: {}", e))?;
         Ok(okm)
+    }
+
+    fn from_master_key(master_key: &[u8], header: VolumeHeader) -> Result<Self> {
+        let (filename_key, filename_hash_key) = Self::derive_filename_keys(master_key)?;
+        let cipher = Self::build_cipher(master_key)?;
+        let filename_cipher = Self::build_cipher(&filename_key)?;
+        Ok(Self {
+            cipher,
+            header,
+            filename_cipher,
+            filename_hash_key,
+        })
+    }
+
+    fn build_cipher(key: &[u8]) -> Result<XChaCha20Poly1305> {
+        let k = Key::try_from(key).map_err(|_| anyhow::anyhow!("invalid cipher key length"))?;
+        Ok(XChaCha20Poly1305::new(&k))
+    }
+
+    fn derive_filename_keys(master_key: &[u8]) -> Result<([u8; KEY_LEN], [u8; KEY_LEN])> {
+        let hkdf = Hkdf::<Sha256>::new(None, master_key);
+        let mut filename_key = [0u8; KEY_LEN];
+        let mut filename_hash_key = [0u8; KEY_LEN];
+        hkdf.expand(b"pqfs-filename-key", &mut filename_key)
+            .map_err(|e| anyhow::anyhow!("HKDF filename key expand failed: {}", e))?;
+        hkdf.expand(b"pqfs-filename-hash-key", &mut filename_hash_key)
+            .map_err(|e| anyhow::anyhow!("HKDF filename hash key expand failed: {}", e))?;
+        Ok((filename_key, filename_hash_key))
+    }
+
+    pub fn hash_filename(&self, name: &str) -> [u8; KEY_LEN] {
+        let mut mac =
+            Hmac::<Sha256>::new_from_slice(&self.filename_hash_key).expect("valid HMAC key size");
+        mac.update(name.as_bytes());
+        let bytes = mac.finalize().into_bytes();
+        let mut out = [0u8; KEY_LEN];
+        out.copy_from_slice(&bytes);
+        out
+    }
+
+    pub fn encrypt_filename(&self, name: &str) -> Result<Vec<u8>> {
+        let nonce = Self::random_nonce();
+        let ciphertext = self
+            .filename_cipher
+            .encrypt(&nonce, name.as_bytes())
+            .context("filename encryption failed")?;
+        let mut out = Vec::with_capacity(NONCE_LEN + ciphertext.len());
+        out.extend_from_slice(nonce.as_ref());
+        out.extend_from_slice(&ciphertext);
+        Ok(out)
+    }
+
+    pub fn decrypt_filename(&self, blob: &[u8]) -> Result<String> {
+        if blob.len() < NONCE_LEN + 16 {
+            bail!("encrypted filename too short");
+        }
+        let (nonce, ct) = blob.split_at(NONCE_LEN);
+        let nonce = XNonce::try_from(nonce)
+            .map_err(|_| anyhow::anyhow!("invalid filename nonce length"))?;
+        let plaintext = self
+            .filename_cipher
+            .decrypt(&nonce, ct)
+            .context("filename decryption failed")?;
+        String::from_utf8(plaintext).context("filename is not valid UTF-8")
     }
 
     fn random_nonce() -> XNonce {
