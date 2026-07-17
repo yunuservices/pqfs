@@ -66,7 +66,7 @@ The encrypted backend (`~/pqfs-backend`) will contain:
 
 ## Security Notes
 
-- This is a **proof of concept** for educational / portfolio purposes.
+- This is a **proof of concept** for educational purposes.
 - No formal audit has been performed.
 - The ML-KEM secret seed is stored in the backend, encrypted with a key derived from your password. An attacker needs both the backend and the password to recover it.
 - FUSE userspace filesystems are not as fast as kernel-native encrypted filesystems (e.g., dm-crypt / LUKS).
@@ -101,7 +101,3 @@ The encrypted backend (`~/pqfs-backend`) will contain:
 - [ ] Benchmark vs. ext4 / LUKS
 - [ ] Switchable AES-256-GCM vs. ChaCha20-Poly1305
 - [ ] ML-KEM-1024 / ML-KEM-512 parameter option
-
-## License
-
-MIT
