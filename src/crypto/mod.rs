@@ -10,54 +10,20 @@ use hmac::{Hmac, Mac};
 use ml_kem::Seed;
 use ml_kem::kem::{Ciphertext, Decapsulate, Encapsulate, Kem, KeyExport};
 use rand::Rng;
-use serde::{Deserialize, Serialize};
 use sha2::Sha256;
 
-const KEY_LEN: usize = 32;
-const SALT_LEN: usize = 16;
-const NONCE_LEN: usize = 24;
-const SEED_LEN: usize = 64;
+mod header;
+mod kem;
 
-#[cfg(all(feature = "ml-kem-512", feature = "ml-kem-768"))]
-compile_error!("Only one ML-KEM parameter feature may be enabled at a time.");
-#[cfg(all(feature = "ml-kem-512", feature = "ml-kem-1024"))]
-compile_error!("Only one ML-KEM parameter feature may be enabled at a time.");
-#[cfg(all(feature = "ml-kem-768", feature = "ml-kem-1024"))]
-compile_error!("Only one ML-KEM parameter feature may be enabled at a time.");
-#[cfg(not(any(
-    feature = "ml-kem-512",
-    feature = "ml-kem-768",
-    feature = "ml-kem-1024"
-)))]
-compile_error!(
-    "You must enable one of the ML-KEM parameter features: ml-kem-512, ml-kem-768, or ml-kem-1024."
-);
+pub(crate) use header::VolumeHeader;
+use kem::{SELECTED_KEM_PARAM, SelectedKem};
 
-#[cfg(feature = "ml-kem-512")]
-type SelectedKem = ml_kem::MlKem512;
-#[cfg(feature = "ml-kem-768")]
-type SelectedKem = ml_kem::MlKem768;
-#[cfg(feature = "ml-kem-1024")]
-type SelectedKem = ml_kem::MlKem1024;
+pub(crate) const KEY_LEN: usize = 32;
+pub(crate) const SALT_LEN: usize = 16;
+pub(crate) const NONCE_LEN: usize = 24;
+pub(crate) const SEED_LEN: usize = 64;
 
-#[cfg(feature = "ml-kem-512")]
-const SELECTED_KEM_PARAM: u16 = 512;
-#[cfg(feature = "ml-kem-768")]
-const SELECTED_KEM_PARAM: u16 = 768;
-#[cfg(feature = "ml-kem-1024")]
-const SELECTED_KEM_PARAM: u16 = 1024;
-
-/// On-disk header stored in the backend root.
-#[derive(Serialize, Deserialize, Debug)]
-pub struct VolumeHeader {
-    pub salt: [u8; SALT_LEN],
-    pub kem_param: u16,
-    pub kem_ciphertext: Vec<u8>,
-    pub kem_public_key: Vec<u8>,
-    pub encrypted_seed: Vec<u8>,
-}
-
-/// Hybrid crypto engine: classical password + ML-KEM-768 shared secret.
+/// Hybrid crypto engine: classical password + ML-KEM selected-parameter-set shared secret.
 pub struct Crypto {
     cipher: XChaCha20Poly1305,
     header: VolumeHeader,
@@ -123,6 +89,7 @@ impl Crypto {
         let data = fs::read(&header_path)
             .with_context(|| format!("failed to read {}", header_path.display()))?;
         let header: VolumeHeader = bincode::deserialize(&data)?;
+
         if header.kem_param != SELECTED_KEM_PARAM {
             bail!(
                 "volume uses ML-KEM-{} but this binary is built for ML-KEM-{}",
@@ -188,6 +155,73 @@ impl Crypto {
             .context("decryption failed (corrupted or tampered data)")
     }
 
+    pub fn random_key(&self) -> [u8; KEY_LEN] {
+        let mut key = [0u8; KEY_LEN];
+        rand::rng().fill_bytes(&mut key);
+        key
+    }
+
+    pub fn encrypt_with_key(&self, key: &[u8], plaintext: &[u8]) -> Result<Vec<u8>> {
+        let cipher = Self::build_cipher(key)?;
+        let nonce = Self::random_nonce();
+        let ciphertext = cipher
+            .encrypt(&nonce, plaintext)
+            .context("per-file key encryption failed")?;
+        let mut out = Vec::with_capacity(NONCE_LEN + ciphertext.len());
+        out.extend_from_slice(nonce.as_ref());
+        out.extend_from_slice(&ciphertext);
+        Ok(out)
+    }
+
+    pub fn decrypt_with_key(&self, key: &[u8], blob: &[u8]) -> Result<Vec<u8>> {
+        if blob.len() < NONCE_LEN + 16 {
+            bail!("per-file ciphertext too short");
+        }
+        let (nonce, ct) = blob.split_at(NONCE_LEN);
+        let nonce = XNonce::try_from(nonce)
+            .map_err(|_| anyhow::anyhow!("invalid per-file nonce length"))?;
+        let cipher = Self::build_cipher(key)?;
+        cipher
+            .decrypt(&nonce, ct)
+            .context("per-file key decryption failed")
+    }
+
+    pub fn hash_filename(&self, name: &str) -> [u8; KEY_LEN] {
+        let mut mac =
+            Hmac::<Sha256>::new_from_slice(&self.filename_hash_key).expect("valid HMAC key size");
+        mac.update(name.as_bytes());
+        let bytes = mac.finalize().into_bytes();
+        let mut out = [0u8; KEY_LEN];
+        out.copy_from_slice(&bytes);
+        out
+    }
+
+    pub fn encrypt_filename(&self, name: &str) -> Result<Vec<u8>> {
+        let nonce = Self::random_nonce();
+        let ciphertext = self
+            .filename_cipher
+            .encrypt(&nonce, name.as_bytes())
+            .context("filename encryption failed")?;
+        let mut out = Vec::with_capacity(NONCE_LEN + ciphertext.len());
+        out.extend_from_slice(nonce.as_ref());
+        out.extend_from_slice(&ciphertext);
+        Ok(out)
+    }
+
+    pub fn decrypt_filename(&self, blob: &[u8]) -> Result<String> {
+        if blob.len() < NONCE_LEN + 16 {
+            bail!("encrypted filename too short");
+        }
+        let (nonce, ct) = blob.split_at(NONCE_LEN);
+        let nonce = XNonce::try_from(nonce)
+            .map_err(|_| anyhow::anyhow!("invalid filename nonce length"))?;
+        let plaintext = self
+            .filename_cipher
+            .decrypt(&nonce, ct)
+            .context("filename decryption failed")?;
+        String::from_utf8(plaintext).context("filename is not valid UTF-8")
+    }
+
     fn save(&self, backend: &Path) -> Result<()> {
         let header_path = backend.join(Self::HEADER_FILE);
         let data = bincode::serialize(&self.header)?;
@@ -241,73 +275,6 @@ impl Crypto {
         hkdf.expand(b"pqfs-filename-hash-key", &mut filename_hash_key)
             .map_err(|e| anyhow::anyhow!("HKDF filename hash key expand failed: {}", e))?;
         Ok((filename_key, filename_hash_key))
-    }
-
-    pub fn hash_filename(&self, name: &str) -> [u8; KEY_LEN] {
-        let mut mac =
-            Hmac::<Sha256>::new_from_slice(&self.filename_hash_key).expect("valid HMAC key size");
-        mac.update(name.as_bytes());
-        let bytes = mac.finalize().into_bytes();
-        let mut out = [0u8; KEY_LEN];
-        out.copy_from_slice(&bytes);
-        out
-    }
-
-    pub fn encrypt_filename(&self, name: &str) -> Result<Vec<u8>> {
-        let nonce = Self::random_nonce();
-        let ciphertext = self
-            .filename_cipher
-            .encrypt(&nonce, name.as_bytes())
-            .context("filename encryption failed")?;
-        let mut out = Vec::with_capacity(NONCE_LEN + ciphertext.len());
-        out.extend_from_slice(nonce.as_ref());
-        out.extend_from_slice(&ciphertext);
-        Ok(out)
-    }
-
-    pub fn decrypt_filename(&self, blob: &[u8]) -> Result<String> {
-        if blob.len() < NONCE_LEN + 16 {
-            bail!("encrypted filename too short");
-        }
-        let (nonce, ct) = blob.split_at(NONCE_LEN);
-        let nonce = XNonce::try_from(nonce)
-            .map_err(|_| anyhow::anyhow!("invalid filename nonce length"))?;
-        let plaintext = self
-            .filename_cipher
-            .decrypt(&nonce, ct)
-            .context("filename decryption failed")?;
-        String::from_utf8(plaintext).context("filename is not valid UTF-8")
-    }
-
-    pub fn random_key(&self) -> [u8; KEY_LEN] {
-        let mut key = [0u8; KEY_LEN];
-        rand::rng().fill_bytes(&mut key);
-        key
-    }
-
-    pub fn encrypt_with_key(&self, key: &[u8], plaintext: &[u8]) -> Result<Vec<u8>> {
-        let cipher = Self::build_cipher(key)?;
-        let nonce = Self::random_nonce();
-        let ciphertext = cipher
-            .encrypt(&nonce, plaintext)
-            .context("per-file key encryption failed")?;
-        let mut out = Vec::with_capacity(NONCE_LEN + ciphertext.len());
-        out.extend_from_slice(nonce.as_ref());
-        out.extend_from_slice(&ciphertext);
-        Ok(out)
-    }
-
-    pub fn decrypt_with_key(&self, key: &[u8], blob: &[u8]) -> Result<Vec<u8>> {
-        if blob.len() < NONCE_LEN + 16 {
-            bail!("per-file ciphertext too short");
-        }
-        let (nonce, ct) = blob.split_at(NONCE_LEN);
-        let nonce = XNonce::try_from(nonce)
-            .map_err(|_| anyhow::anyhow!("invalid per-file nonce length"))?;
-        let cipher = Self::build_cipher(key)?;
-        cipher
-            .decrypt(&nonce, ct)
-            .context("per-file key decryption failed")
     }
 
     fn random_nonce() -> XNonce {

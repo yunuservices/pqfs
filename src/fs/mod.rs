@@ -1,6 +1,14 @@
+mod entry;
+mod inner;
+mod ops;
+
+pub(crate) use entry::{Entry, EntryKind};
+pub(crate) use inner::PqfsInner;
+
 use std::ffi::OsStr;
 use std::sync::{Arc, Mutex, mpsc};
 use std::thread::{self, JoinHandle};
+use std::time::Duration;
 
 use anyhow::{Context, Result};
 use fuser::{
@@ -11,7 +19,10 @@ use tracing::debug;
 
 use crate::cli::Args;
 use crate::crypto::Crypto;
-use crate::fs::PqfsInner;
+
+pub(crate) const INDEX_FILE: &str = "pqfs.index";
+pub(crate) const TTL: Duration = Duration::from_secs(1);
+pub(crate) const BLOCK_SIZE: u64 = 512;
 
 /// Thread-pool wrapper around `PqfsInner`. Metadata operations are handled
 /// synchronously; read/write work is offloaded to worker threads so the FUSE
@@ -121,12 +132,12 @@ impl Drop for Pqfs {
 }
 
 impl Filesystem for Pqfs {
-    fn lookup(&mut self, req: &Request<'_>, parent: u64, name: &OsStr, reply: ReplyEntry) {
-        <PqfsInner as Filesystem>::lookup(&mut *self.lock_inner(), req, parent, name, reply);
+    fn lookup(&mut self, _req: &Request<'_>, parent: u64, name: &OsStr, reply: ReplyEntry) {
+        self.lock_inner().lookup(parent, name, reply);
     }
 
-    fn getattr(&mut self, req: &Request<'_>, ino: u64, reply: ReplyAttr) {
-        <PqfsInner as Filesystem>::getattr(&mut *self.lock_inner(), req, ino, reply);
+    fn getattr(&mut self, _req: &Request<'_>, ino: u64, reply: ReplyAttr) {
+        self.lock_inner().getattr(ino, reply);
     }
 
     fn read(
@@ -165,88 +176,62 @@ impl Filesystem for Pqfs {
 
     fn readdir(
         &mut self,
-        req: &Request<'_>,
+        _req: &Request<'_>,
         ino: u64,
         _fh: u64,
         offset: i64,
         reply: ReplyDirectory,
     ) {
-        <PqfsInner as Filesystem>::readdir(&mut *self.lock_inner(), req, ino, 0, offset, reply);
+        self.lock_inner().readdir(ino, offset, reply);
     }
 
     fn create(
         &mut self,
-        req: &Request<'_>,
+        _req: &Request<'_>,
         parent: u64,
         name: &OsStr,
         mode: u32,
-        umask: u32,
-        flags: i32,
+        _umask: u32,
+        _flags: i32,
         reply: ReplyCreate,
     ) {
-        <PqfsInner as Filesystem>::create(
-            &mut *self.lock_inner(),
-            req,
-            parent,
-            name,
-            mode,
-            umask,
-            flags,
-            reply,
-        );
+        self.lock_inner().create(parent, name, mode, reply);
     }
 
     fn mkdir(
         &mut self,
-        req: &Request<'_>,
+        _req: &Request<'_>,
         parent: u64,
         name: &OsStr,
         mode: u32,
-        umask: u32,
+        _umask: u32,
         reply: ReplyEntry,
     ) {
-        <PqfsInner as Filesystem>::mkdir(
-            &mut *self.lock_inner(),
-            req,
-            parent,
-            name,
-            mode,
-            umask,
-            reply,
-        );
+        self.lock_inner().mkdir(parent, name, mode, reply);
     }
 
-    fn unlink(&mut self, req: &Request<'_>, parent: u64, name: &OsStr, reply: ReplyEmpty) {
-        <PqfsInner as Filesystem>::unlink(&mut *self.lock_inner(), req, parent, name, reply);
+    fn unlink(&mut self, _req: &Request<'_>, parent: u64, name: &OsStr, reply: ReplyEmpty) {
+        self.lock_inner().unlink(parent, name, reply);
     }
 
-    fn rmdir(&mut self, req: &Request<'_>, parent: u64, name: &OsStr, reply: ReplyEmpty) {
-        <PqfsInner as Filesystem>::rmdir(&mut *self.lock_inner(), req, parent, name, reply);
+    fn rmdir(&mut self, _req: &Request<'_>, parent: u64, name: &OsStr, reply: ReplyEmpty) {
+        self.lock_inner().rmdir(parent, name, reply);
     }
 
-    fn open(&mut self, req: &Request<'_>, ino: u64, flags: i32, reply: ReplyOpen) {
-        <PqfsInner as Filesystem>::open(&mut *self.lock_inner(), req, ino, flags, reply);
+    fn open(&mut self, _req: &Request<'_>, ino: u64, _flags: i32, reply: ReplyOpen) {
+        self.lock_inner().open(ino, reply);
     }
 
     fn release(
         &mut self,
-        req: &Request<'_>,
-        ino: u64,
-        fh: u64,
-        flags: i32,
-        lock_owner: Option<u64>,
-        flush: bool,
+        _req: &Request<'_>,
+        _ino: u64,
+        _fh: u64,
+        _flags: i32,
+        _lock_owner: Option<u64>,
+        _flush: bool,
         reply: ReplyEmpty,
     ) {
-        <PqfsInner as Filesystem>::release(
-            &mut *self.lock_inner(),
-            req,
-            ino,
-            fh,
-            flags,
-            lock_owner,
-            flush,
-            reply,
-        );
+        self.lock_inner().release(reply);
     }
 }
