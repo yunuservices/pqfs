@@ -57,7 +57,7 @@ impl Crypto {
         let (ct, shared_secret) = ek.encapsulate();
 
         let seed = dk.to_seed().context("failed to extract ML-KEM seed")?;
-        let seed_bytes: Vec<u8> = seed.as_ref().to_vec();
+        let seed_bytes: Vec<u8> = AsRef::<[u8]>::as_ref(&seed).to_vec();
         let sk_nonce = Self::random_nonce();
         let encrypted_seed = pw_cipher
             .encrypt(&sk_nonce, seed_bytes.as_ref())
@@ -68,15 +68,18 @@ impl Crypto {
         encrypted_seed_blob.extend_from_slice(sk_nonce.as_ref());
         encrypted_seed_blob.extend_from_slice(&encrypted_seed);
 
-        let master_key = Self::derive_master_key(&password_key, shared_secret.as_ref())?;
+        let master_key = Self::derive_master_key(
+            &password_key,
+            AsRef::<[u8]>::as_ref(&shared_secret),
+        )?;
         let master_chacha_key = Key::try_from(master_key.as_slice())
             .map_err(|_| anyhow::anyhow!("invalid master key length"))?;
         let cipher = XChaCha20Poly1305::new(&master_chacha_key);
 
         let header = VolumeHeader {
             salt,
-            kem_ciphertext: ct.as_ref().to_vec(),
-            kem_public_key: ek.to_bytes().as_ref().to_vec(),
+            kem_ciphertext: AsRef::<[u8]>::as_ref(&ct).to_vec(),
+            kem_public_key: AsRef::<[u8]>::as_ref(&ek.to_bytes()).to_vec(),
             encrypted_seed: encrypted_seed_blob,
         };
 
@@ -118,7 +121,10 @@ impl Crypto {
             .map_err(|_| anyhow::anyhow!("invalid ML-KEM ciphertext"))?;
         let shared_secret = dk.decapsulate(&ct_array);
 
-        let master_key = Self::derive_master_key(&password_key, shared_secret.as_ref())?;
+        let master_key = Self::derive_master_key(
+            &password_key,
+            AsRef::<[u8]>::as_ref(&shared_secret),
+        )?;
         let master_chacha_key = Key::try_from(master_key.as_slice())
             .map_err(|_| anyhow::anyhow!("invalid master key length"))?;
         let cipher = XChaCha20Poly1305::new(&master_chacha_key);
