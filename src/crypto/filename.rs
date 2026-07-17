@@ -1,6 +1,6 @@
 use anyhow::{Context, Result, bail};
 use chacha20poly1305::XNonce;
-use chacha20poly1305::aead::Aead;
+use chacha20poly1305::aead::{Aead, KeyInit};
 use hmac::{Hmac, Mac};
 use sha2::Sha256;
 
