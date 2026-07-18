@@ -89,7 +89,8 @@ mod tests {
     fn decrypt_rejects_tampered_ciphertext() {
         let crypto = crypto();
         let mut ciphertext = crypto.encrypt(b"secret").unwrap();
-        ciphertext[ciphertext.len() - 1] ^= 1;
+        let last = ciphertext.len() - 1;
+        ciphertext[last] ^= 1;
         assert!(crypto.decrypt(&ciphertext).is_err());
     }
 
