@@ -157,9 +157,26 @@ mod tests {
         let first = inner.allocate_ino();
         assert_eq!(first, FUSE_ROOT_ID + 1);
 
+        inner.entries.insert(
+            first,
+            Entry {
+                ino: first,
+                parent: FUSE_ROOT_ID,
+                name_hash: [0u8; 32],
+                name_encrypted: Vec::new(),
+                content_key: Vec::new(),
+                kind: EntryKind::File,
+                size: 0,
+                perm: 0o644,
+                uid: 0,
+                gid: 0,
+            },
+        );
+
         inner.save_index(&crypto).unwrap();
         let reloaded = PqfsInner::load(dir.path().to_path_buf(), &crypto).unwrap();
         assert!(reloaded.entries.contains_key(&FUSE_ROOT_ID));
+        assert!(reloaded.entries.contains_key(&first));
         assert_eq!(reloaded.next_ino, inner.next_ino);
     }
 }
