@@ -56,3 +56,46 @@ impl Crypto {
             .context("per-file key decryption failed")
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::super::Crypto;
+
+    fn crypto() -> Crypto {
+        let dir = tempfile::tempdir().unwrap();
+        Crypto::init("test-password", dir.path()).unwrap()
+    }
+
+    #[test]
+    fn encrypt_decrypt_roundtrip() {
+        let crypto = crypto();
+        let plaintext = b"hello quantum world";
+        let ciphertext = crypto.encrypt(plaintext).unwrap();
+        let decrypted = crypto.decrypt(&ciphertext).unwrap();
+        assert_eq!(decrypted, plaintext);
+    }
+
+    #[test]
+    fn encrypt_decrypt_with_per_file_key_roundtrip() {
+        let crypto = crypto();
+        let content_key = crypto.random_key();
+        let plaintext = b"per-file secret";
+        let ciphertext = crypto.encrypt_with_key(&content_key, plaintext).unwrap();
+        let decrypted = crypto.decrypt_with_key(&content_key, &ciphertext).unwrap();
+        assert_eq!(decrypted, plaintext);
+    }
+
+    #[test]
+    fn decrypt_rejects_tampered_ciphertext() {
+        let crypto = crypto();
+        let mut ciphertext = crypto.encrypt(b"secret").unwrap();
+        ciphertext[ciphertext.len() - 1] ^= 1;
+        assert!(crypto.decrypt(&ciphertext).is_err());
+    }
+
+    #[test]
+    fn decrypt_rejects_short_ciphertext() {
+        let crypto = crypto();
+        assert!(crypto.decrypt(&[0u8; 10]).is_err());
+    }
+}

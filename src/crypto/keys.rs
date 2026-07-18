@@ -75,3 +75,50 @@ impl Crypto {
         key
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn random_nonce_has_correct_length() {
+        assert_eq!(random_nonce().len(), NONCE_LEN);
+    }
+
+    #[test]
+    fn derive_password_key_produces_32_bytes() {
+        let salt = [0u8; SALT_LEN];
+        let key = derive_password_key("password", &salt).unwrap();
+        assert_eq!(key.len(), KEY_LEN);
+    }
+
+    #[test]
+    fn derive_password_key_is_deterministic() {
+        let salt = [1u8; SALT_LEN];
+        let a = derive_password_key("same", &salt).unwrap();
+        let b = derive_password_key("same", &salt).unwrap();
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn derive_master_key_is_32_bytes_and_sensitive_to_input() {
+        let pw = derive_password_key("pw", &[0u8; SALT_LEN]).unwrap();
+        let ss = [0u8; 64];
+        let key_a = derive_master_key(&pw, &ss).unwrap();
+        assert_eq!(key_a.len(), KEY_LEN);
+
+        let mut ss2 = ss;
+        ss2[0] ^= 1;
+        let key_b = derive_master_key(&pw, &ss2).unwrap();
+        assert_ne!(key_a, key_b);
+    }
+
+    #[test]
+    fn derive_filename_keys_are_independent() {
+        let master = [7u8; KEY_LEN];
+        let (a, b) = derive_filename_keys(&master).unwrap();
+        assert_eq!(a.len(), KEY_LEN);
+        assert_eq!(b.len(), KEY_LEN);
+        assert_ne!(a, b);
+    }
+}

@@ -115,3 +115,40 @@ impl Crypto {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn init_creates_volume_header() {
+        let dir = tempfile::tempdir().unwrap();
+        let _ = Crypto::init("pw", dir.path()).unwrap();
+        assert!(dir.path().join("pqfs.header").exists());
+    }
+
+    #[test]
+    fn init_refuses_existing_volume() {
+        let dir = tempfile::tempdir().unwrap();
+        let _ = Crypto::init("pw", dir.path()).unwrap();
+        assert!(Crypto::init("pw", dir.path()).is_err());
+    }
+
+    #[test]
+    fn load_roundtrip_succeeds() {
+        let dir = tempfile::tempdir().unwrap();
+        let crypto = Crypto::init("my-password", dir.path()).unwrap();
+        let ciphertext = crypto.encrypt(b"payload").unwrap();
+
+        let loaded = Crypto::load("my-password", dir.path()).unwrap();
+        let decrypted = loaded.decrypt(&ciphertext).unwrap();
+        assert_eq!(decrypted, b"payload");
+    }
+
+    #[test]
+    fn load_with_wrong_password_fails() {
+        let dir = tempfile::tempdir().unwrap();
+        let _ = Crypto::init("right-password", dir.path()).unwrap();
+        assert!(Crypto::load("wrong-password", dir.path()).is_err());
+    }
+}

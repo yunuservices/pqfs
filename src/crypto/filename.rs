@@ -44,3 +44,41 @@ impl Crypto {
         String::from_utf8(plaintext).context("filename is not valid UTF-8")
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::super::Crypto;
+
+    fn crypto() -> Crypto {
+        let dir = tempfile::tempdir().unwrap();
+        Crypto::init("test-password", dir.path()).unwrap()
+    }
+
+    #[test]
+    fn encrypt_decrypt_filename_roundtrip() {
+        let crypto = crypto();
+        let name = "my secret document.txt";
+        let encrypted = crypto.encrypt_filename(name).unwrap();
+        let decrypted = crypto.decrypt_filename(&encrypted).unwrap();
+        assert_eq!(decrypted, name);
+    }
+
+    #[test]
+    fn hash_filename_is_deterministic() {
+        let crypto = crypto();
+        let name = "document.txt";
+        assert_eq!(crypto.hash_filename(name), crypto.hash_filename(name));
+    }
+
+    #[test]
+    fn hash_filename_differs_for_different_names() {
+        let crypto = crypto();
+        assert_ne!(crypto.hash_filename("a"), crypto.hash_filename("b"));
+    }
+
+    #[test]
+    fn decrypt_filename_rejects_short_blob() {
+        let crypto = crypto();
+        assert!(crypto.decrypt_filename(&[0u8; 10]).is_err());
+    }
+}

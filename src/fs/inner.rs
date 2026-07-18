@@ -122,3 +122,44 @@ impl PqfsInner {
         ino
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::crypto::Crypto;
+
+    fn setup() -> (tempfile::TempDir, Crypto) {
+        let dir = tempfile::tempdir().unwrap();
+        let crypto = Crypto::init("test-password", dir.path()).unwrap();
+        (dir, crypto)
+    }
+
+    #[test]
+    fn load_creates_root_entry() {
+        let (dir, crypto) = setup();
+        let inner = PqfsInner::load(dir.path().to_path_buf(), &crypto).unwrap();
+        assert!(inner.entries.contains_key(&FUSE_ROOT_ID));
+        assert_eq!(inner.next_ino, FUSE_ROOT_ID + 1);
+    }
+
+    #[test]
+    fn save_index_creates_file() {
+        let (dir, crypto) = setup();
+        let mut inner = PqfsInner::load(dir.path().to_path_buf(), &crypto).unwrap();
+        inner.save_index(&crypto).unwrap();
+        assert!(dir.path().join(INDEX_FILE).exists());
+    }
+
+    #[test]
+    fn save_and_reload_preserves_entries() {
+        let (dir, crypto) = setup();
+        let mut inner = PqfsInner::load(dir.path().to_path_buf(), &crypto).unwrap();
+        let first = inner.allocate_ino();
+        assert_eq!(first, FUSE_ROOT_ID + 1);
+
+        inner.save_index(&crypto).unwrap();
+        let reloaded = PqfsInner::load(dir.path().to_path_buf(), &crypto).unwrap();
+        assert!(reloaded.entries.contains_key(&FUSE_ROOT_ID));
+        assert_eq!(reloaded.next_ino, inner.next_ino);
+    }
+}
