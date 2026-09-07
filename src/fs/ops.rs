@@ -64,9 +64,8 @@ impl PqfsInner {
             }
         };
 
-        let offset = offset as usize;
-        let end = plaintext.len().min(offset + size as usize);
-        reply.data(&plaintext[offset..end]);
+        let (start, end) = clamp_read_range(plaintext.len(), offset, size);
+        reply.data(&plaintext[start..end]);
     }
 
     /// Read the existing plaintext for a file write. Performed outside the
@@ -414,5 +413,40 @@ fn decrypt_file_content(crypto: &Crypto, entry: &Entry, ciphertext: &[u8]) -> Re
                 Err(EIO)
             }
         }
+    }
+}
+
+fn clamp_read_range(len: usize, offset: i64, size: u32) -> (usize, usize) {
+    let start = usize::try_from(offset).unwrap_or(0).min(len);
+    let end = start.saturating_add(size as usize).min(len);
+    (start, end)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn read_range_past_eof_is_empty() {
+        assert_eq!(clamp_read_range(5, 10, 4096), (5, 5));
+        assert_eq!(clamp_read_range(5, 5, 4096), (5, 5));
+        assert_eq!(clamp_read_range(0, 0, 4096), (0, 0));
+    }
+
+    #[test]
+    fn read_range_is_truncated_at_eof() {
+        assert_eq!(clamp_read_range(5, 0, 4096), (0, 5));
+        assert_eq!(clamp_read_range(5, 2, 2), (2, 4));
+        assert_eq!(clamp_read_range(5, 2, 100), (2, 5));
+    }
+
+    #[test]
+    fn read_range_rejects_negative_offset() {
+        assert_eq!(clamp_read_range(5, -1, 4096), (0, 5));
+    }
+
+    #[test]
+    fn read_range_does_not_overflow() {
+        assert_eq!(clamp_read_range(5, i64::MAX, u32::MAX), (5, 5));
     }
 }
