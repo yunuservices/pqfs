@@ -425,6 +425,9 @@ fn clamp_read_range(len: usize, offset: i64, size: u32) -> (usize, usize) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::fs::entry::{Entry, EntryKind};
+    use crate::fs::inner::PqfsInner;
+    use std::sync::{Arc, RwLock};
 
     #[test]
     fn read_range_past_eof_is_empty() {
@@ -448,5 +451,71 @@ mod tests {
     #[test]
     fn read_range_does_not_overflow() {
         assert_eq!(clamp_read_range(5, i64::MAX, u32::MAX), (5, 5));
+    }
+
+    #[test]
+    fn concurrent_writes_to_one_inode_do_not_lose_data() {
+        for _ in 0..8 {
+            let dir = tempfile::tempdir().unwrap();
+            let crypto = Arc::new(Crypto::init("pw", dir.path()).unwrap());
+            let mut inner = PqfsInner::load(dir.path().to_path_buf(), &crypto).unwrap();
+            let ino = inner.allocate_ino();
+            inner.entries.insert(
+                ino,
+                Entry {
+                    ino,
+                    parent: 1,
+                    name_hash: [0u8; 32],
+                    name_encrypted: Vec::new(),
+                    content_key: Vec::new(),
+                    kind: EntryKind::File,
+                    size: 0,
+                    perm: 0o644,
+                    uid: 0,
+                    gid: 0,
+                },
+            );
+            let data_path = inner.data_path(ino);
+            let inner = Arc::new(RwLock::new(inner));
+            let lock = Arc::new(RwLock::new(()));
+
+            let handles: Vec<_> = [(0i64, b'A'), (4096i64, b'B')]
+                .into_iter()
+                .map(|(offset, byte)| {
+                    let inner = Arc::clone(&inner);
+                    let crypto = Arc::clone(&crypto);
+                    let lock = Arc::clone(&lock);
+                    let data_path = data_path.clone();
+                    std::thread::spawn(move || {
+                        let _guard = lock.write().unwrap();
+                        let entry = inner.read().unwrap().entries.get(&ino).cloned().unwrap();
+                        let (key, size) = PqfsInner::do_write_data(
+                            crypto.as_ref(),
+                            &entry,
+                            data_path,
+                            offset,
+                            &[byte; 1024],
+                        )
+                        .unwrap();
+                        let mut guard = inner.write().unwrap();
+                        let e = guard.entries.get_mut(&ino).unwrap();
+                        e.content_key = key;
+                        e.size = e.size.max(size);
+                    })
+                })
+                .collect();
+            for h in handles {
+                h.join().unwrap();
+            }
+
+            let guard = inner.read().unwrap();
+            let entry = guard.entries.get(&ino).unwrap();
+            let ciphertext = std::fs::read(guard.data_path(ino)).unwrap();
+            let plaintext = decrypt_file_content(crypto.as_ref(), entry, &ciphertext).unwrap();
+
+            assert_eq!(plaintext.len(), 4096 + 1024);
+            assert!(plaintext[0..1024].iter().all(|b| *b == b'A'));
+            assert!(plaintext[4096..5120].iter().all(|b| *b == b'B'));
+        }
     }
 }

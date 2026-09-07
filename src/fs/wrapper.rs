@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::ffi::OsStr;
 use std::sync::{Arc, Mutex, RwLock, mpsc};
 use std::thread::{self, JoinHandle};
@@ -23,6 +24,7 @@ pub struct Pqfs {
     inner: Arc<RwLock<PqfsInner>>,
     crypto: Arc<Crypto>,
     job_tx: Option<mpsc::Sender<Box<dyn FnOnce() + Send>>>,
+    inode_locks: Arc<Mutex<HashMap<u64, Arc<RwLock<()>>>>>,
     workers: Vec<JoinHandle<()>>,
 }
 
@@ -57,6 +59,7 @@ impl Pqfs {
             inner,
             crypto,
             job_tx: Some(tx),
+            inode_locks: Arc::new(Mutex::new(HashMap::new())),
             workers,
         }
     }
@@ -111,6 +114,11 @@ impl Pqfs {
         self.inner.write().unwrap_or_else(|e| e.into_inner())
     }
 
+    fn inode_lock(&self, ino: u64) -> Arc<RwLock<()>> {
+        let mut locks = self.inode_locks.lock().unwrap_or_else(|e| e.into_inner());
+        Arc::clone(locks.entry(ino).or_default())
+    }
+
     fn spawn_job<F>(&self, job: F)
     where
         F: FnOnce() + Send + 'static,
@@ -154,6 +162,7 @@ impl Filesystem for Pqfs {
         reply: ReplyData,
     ) {
         let crypto = Arc::clone(&self.crypto);
+        let lock = self.inode_lock(ino);
 
         let (entry, data_path) = {
             let inner = self.read_inner();
@@ -165,6 +174,7 @@ impl Filesystem for Pqfs {
         match entry {
             Some(entry) if matches!(entry.kind, EntryKind::File) => {
                 self.spawn_job(move || {
+                    let _guard = lock.read().unwrap_or_else(|e| e.into_inner());
                     PqfsInner::do_read(crypto.as_ref(), &entry, data_path, offset, size, reply);
                 });
             }
@@ -188,17 +198,31 @@ impl Filesystem for Pqfs {
         let data = data.to_vec();
         let inner = Arc::clone(&self.inner);
         let crypto = Arc::clone(&self.crypto);
+        let lock = self.inode_lock(ino);
 
-        let (entry, data_path) = {
+        let (kind, data_path) = {
             let inner = self.read_inner();
-            let entry = inner.entries.get(&ino).cloned();
+            let kind = inner.entries.get(&ino).map(|e| e.kind.clone());
             let data_path = inner.data_path(ino);
-            (entry, data_path)
+            (kind, data_path)
         };
 
-        match entry {
-            Some(entry) if matches!(entry.kind, EntryKind::File) => {
+        match kind {
+            Some(EntryKind::File) => {
                 self.spawn_job(move || {
+                    let _guard = lock.write().unwrap_or_else(|e| e.into_inner());
+
+                    let entry = {
+                        let inner = inner.read().unwrap_or_else(|e| e.into_inner());
+                        match inner.entries.get(&ino) {
+                            Some(entry) => entry.clone(),
+                            None => {
+                                reply.error(ENOENT);
+                                return;
+                            }
+                        }
+                    };
+
                     let (content_key_enc, size) = match PqfsInner::do_write_data(
                         crypto.as_ref(),
                         &entry,
@@ -217,7 +241,7 @@ impl Filesystem for Pqfs {
                     inner.commit_write(crypto.as_ref(), ino, content_key_enc, size, reply, written);
                 });
             }
-            Some(_) => reply.error(EISDIR),
+            Some(EntryKind::Dir) => reply.error(EISDIR),
             None => reply.error(ENOENT),
         }
     }
