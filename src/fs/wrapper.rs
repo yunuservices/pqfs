@@ -8,10 +8,11 @@ use fuser::{
     Filesystem, MountOption, ReplyAttr, ReplyCreate, ReplyData, ReplyDirectory, ReplyEmpty,
     ReplyEntry, ReplyOpen, ReplyWrite, Request, TimeOrNow,
 };
-use libc::{EISDIR, ENOENT};
+use libc::{EIO, EISDIR, ENOENT};
 use std::time::SystemTime;
-use tracing::debug;
+use tracing::{debug, error};
 
+use super::blocks;
 use super::entry::EntryKind;
 use super::inner::PqfsInner;
 use crate::cli::Args;
@@ -403,6 +404,75 @@ impl Filesystem for Pqfs {
 
     fn open(&mut self, _req: &Request<'_>, ino: u64, _flags: i32, reply: ReplyOpen) {
         self.read_inner().open(ino, reply);
+    }
+
+    fn fsync(
+        &mut self,
+        _req: &Request<'_>,
+        ino: u64,
+        _fh: u64,
+        _datasync: bool,
+        reply: ReplyEmpty,
+    ) {
+        let crypto = Arc::clone(&self.crypto);
+        let lock = self.inode_lock(ino);
+        let _guard = lock.read().unwrap_or_else(|e| e.into_inner());
+
+        let mut inner = self.write_inner();
+        if let Err(e) = blocks::sync(&inner.data_path(ino)) {
+            error!("fsync error for inode {}: {}", ino, e);
+            reply.error(EIO);
+            return;
+        }
+        if let Err(e) = inner.save_index(crypto.as_ref()) {
+            error!("index save error: {}", e);
+            reply.error(EIO);
+            return;
+        }
+        reply.ok();
+    }
+
+    fn fsyncdir(
+        &mut self,
+        _req: &Request<'_>,
+        _ino: u64,
+        _fh: u64,
+        _datasync: bool,
+        reply: ReplyEmpty,
+    ) {
+        let crypto = Arc::clone(&self.crypto);
+        if let Err(e) = self.write_inner().save_index(crypto.as_ref()) {
+            error!("index save error: {}", e);
+            reply.error(EIO);
+            return;
+        }
+        reply.ok();
+    }
+
+    fn flush(
+        &mut self,
+        _req: &Request<'_>,
+        ino: u64,
+        _fh: u64,
+        _lock_owner: u64,
+        reply: ReplyEmpty,
+    ) {
+        let crypto = Arc::clone(&self.crypto);
+        let lock = self.inode_lock(ino);
+        let _guard = lock.read().unwrap_or_else(|e| e.into_inner());
+
+        let mut inner = self.write_inner();
+        if let Err(e) = blocks::sync(&inner.data_path(ino)) {
+            error!("flush error for inode {}: {}", ino, e);
+            reply.error(EIO);
+            return;
+        }
+        if let Err(e) = inner.save_index(crypto.as_ref()) {
+            error!("index save error: {}", e);
+            reply.error(EIO);
+            return;
+        }
+        reply.ok();
     }
 
     fn release(

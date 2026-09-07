@@ -1,6 +1,5 @@
 use std::ffi::OsStr;
 use std::fs;
-use std::io;
 use std::path::PathBuf;
 
 use fuser::{
@@ -12,6 +11,7 @@ use tracing::{error, warn};
 use zeroize::Zeroizing;
 
 use super::TTL;
+use super::blocks;
 use super::entry::{Entry, EntryKind, Timestamps};
 use super::inner::PqfsInner;
 use crate::crypto::Crypto;
@@ -44,20 +44,12 @@ impl PqfsInner {
         size: u32,
         reply: ReplyData,
     ) {
-        let ciphertext = match fs::read(&data_path) {
-            Ok(v) => v,
-            Err(e) if e.kind() == io::ErrorKind::NotFound => {
-                reply.data(&[]);
-                return;
-            }
-            Err(e) => {
-                error!("read error for {}: {}", data_path.display(), e);
-                reply.error(EIO);
-                return;
-            }
-        };
+        if !data_path.exists() {
+            reply.data(&[]);
+            return;
+        }
 
-        let plaintext = match decrypt_file_content(crypto, entry, &ciphertext) {
+        let content_key = match decrypt_content_key(crypto, &entry.content_key, entry.ino) {
             Ok(v) => v,
             Err(code) => {
                 reply.error(code);
@@ -65,34 +57,23 @@ impl PqfsInner {
             }
         };
 
-        let (start, end) = clamp_read_range(plaintext.len(), offset, size);
-        reply.data(&plaintext[start..end]);
-    }
-
-    /// Read the existing plaintext for a file write. Performed outside the
-    /// metadata lock so that long-running I/O and crypto do not block other
-    /// operations.
-    pub(crate) fn read_existing_plaintext(
-        crypto: &Crypto,
-        entry: &Entry,
-        data_path: PathBuf,
-    ) -> Result<Vec<u8>, i32> {
-        if !data_path.exists() {
-            return Ok(Vec::new());
-        }
-        let ciphertext = match fs::read(&data_path) {
-            Ok(v) => v,
+        let offset = u64::try_from(offset).unwrap_or(0);
+        match blocks::read_range(
+            crypto,
+            content_key.as_slice(),
+            &data_path,
+            entry.size,
+            offset,
+            size as usize,
+        ) {
+            Ok(data) => reply.data(&data),
             Err(e) => {
-                error!("read error on write for {}: {}", data_path.display(), e);
-                return Err(EIO);
+                error!("read error for inode {}: {}", entry.ino, e);
+                reply.error(EIO);
             }
-        };
-        decrypt_file_content(crypto, entry, &ciphertext)
+        }
     }
 
-    /// Encrypt and write the plaintext for a file write. Returns the
-    /// (possibly new) encrypted per-file content key and the final size so the
-    /// caller can update metadata under a short write lock.
     pub(crate) fn do_write_data(
         crypto: &Crypto,
         entry: &Entry,
@@ -100,47 +81,24 @@ impl PqfsInner {
         offset: i64,
         data: &[u8],
     ) -> Result<(Vec<u8>, u64), i32> {
-        let mut plaintext = Self::read_existing_plaintext(crypto, entry, data_path.clone())?;
-
-        // Ensure this file has its own per-file key.
-        let content_key_enc = if entry.content_key.is_empty() {
-            match crypto.encrypt(crypto.random_key().as_slice()) {
-                Ok(v) => v,
-                Err(e) => {
-                    error!("content key encrypt error for inode {}: {}", entry.ino, e);
-                    return Err(EIO);
-                }
-            }
-        } else {
-            entry.content_key.clone()
-        };
-
+        let content_key_enc = ensure_content_key(crypto, entry)?;
         let content_key = decrypt_content_key(crypto, &content_key_enc, entry.ino)?;
+        let offset = u64::try_from(offset).unwrap_or(0);
 
-        let offset = offset as usize;
-        if offset > plaintext.len() {
-            plaintext.resize(offset, 0);
-        }
-        let end = offset + data.len();
-        if end > plaintext.len() {
-            plaintext.resize(end, 0);
-        }
-        plaintext[offset..end].copy_from_slice(data);
-
-        let ciphertext = match crypto.encrypt_with_key(&content_key, &plaintext) {
-            Ok(v) => v,
+        match blocks::write_range(
+            crypto,
+            content_key.as_slice(),
+            &data_path,
+            entry.size,
+            offset,
+            data,
+        ) {
+            Ok(size) => Ok((content_key_enc, size)),
             Err(e) => {
-                error!("encrypt error for {}: {}", data_path.display(), e);
-                return Err(EIO);
+                error!("write error for inode {}: {}", entry.ino, e);
+                Err(EIO)
             }
-        };
-
-        if let Err(e) = fs::write(&data_path, ciphertext) {
-            error!("write error for {}: {}", data_path.display(), e);
-            return Err(EIO);
         }
-
-        Ok((content_key_enc, plaintext.len() as u64))
     }
 
     pub(crate) fn do_truncate(
@@ -149,35 +107,16 @@ impl PqfsInner {
         data_path: PathBuf,
         size: u64,
     ) -> Result<(Vec<u8>, u64), i32> {
-        let mut plaintext = Self::read_existing_plaintext(crypto, entry, data_path.clone())?;
-        plaintext.resize(size as usize, 0);
-
-        let content_key_enc = if entry.content_key.is_empty() {
-            match crypto.encrypt(crypto.random_key().as_slice()) {
-                Ok(v) => v,
-                Err(e) => {
-                    error!("content key encrypt error for inode {}: {}", entry.ino, e);
-                    return Err(EIO);
-                }
-            }
-        } else {
-            entry.content_key.clone()
-        };
+        let content_key_enc = ensure_content_key(crypto, entry)?;
         let content_key = decrypt_content_key(crypto, &content_key_enc, entry.ino)?;
 
-        let ciphertext = match crypto.encrypt_with_key(&content_key, &plaintext) {
-            Ok(v) => v,
+        match blocks::truncate(crypto, content_key.as_slice(), &data_path, entry.size, size) {
+            Ok(()) => Ok((content_key_enc, size)),
             Err(e) => {
-                error!("encrypt error for {}: {}", data_path.display(), e);
-                return Err(EIO);
+                error!("truncate error for inode {}: {}", entry.ino, e);
+                Err(EIO)
             }
-        };
-        if let Err(e) = fs::write(&data_path, ciphertext) {
-            error!("write error for {}: {}", data_path.display(), e);
-            return Err(EIO);
         }
-
-        Ok((content_key_enc, plaintext.len() as u64))
     }
 
     pub(crate) fn readdir(
@@ -569,6 +508,16 @@ impl PqfsInner {
     }
 }
 
+fn ensure_content_key(crypto: &Crypto, entry: &Entry) -> Result<Vec<u8>, i32> {
+    if !entry.content_key.is_empty() {
+        return Ok(entry.content_key.clone());
+    }
+    crypto.encrypt(crypto.random_key().as_slice()).map_err(|e| {
+        error!("content key encrypt error for inode {}: {}", entry.ino, e);
+        EIO
+    })
+}
+
 fn decrypt_content_key(
     crypto: &Crypto,
     content_key_enc: &[u8],
@@ -590,34 +539,6 @@ fn decrypt_content_key(
     }
 }
 
-fn decrypt_file_content(crypto: &Crypto, entry: &Entry, ciphertext: &[u8]) -> Result<Vec<u8>, i32> {
-    if entry.content_key.is_empty() {
-        // Legacy file: content encrypted directly with the master key.
-        match crypto.decrypt(ciphertext) {
-            Ok(v) => Ok(v),
-            Err(e) => {
-                error!("decrypt error for inode {}: {}", entry.ino, e);
-                Err(EIO)
-            }
-        }
-    } else {
-        let content_key = decrypt_content_key(crypto, &entry.content_key, entry.ino)?;
-        match crypto.decrypt_with_key(&content_key, ciphertext) {
-            Ok(v) => Ok(v),
-            Err(e) => {
-                error!("decrypt error for inode {}: {}", entry.ino, e);
-                Err(EIO)
-            }
-        }
-    }
-}
-
-fn clamp_read_range(len: usize, offset: i64, size: u32) -> (usize, usize) {
-    let start = usize::try_from(offset).unwrap_or(0).min(len);
-    let end = start.saturating_add(size as usize).min(len);
-    (start, end)
-}
-
 fn time_or_now_nanos(value: TimeOrNow) -> u64 {
     match value {
         TimeOrNow::SpecificTime(time) => time
@@ -634,30 +555,6 @@ mod tests {
     use crate::fs::entry::{Entry, EntryKind};
     use crate::fs::inner::PqfsInner;
     use std::sync::{Arc, RwLock};
-
-    #[test]
-    fn read_range_past_eof_is_empty() {
-        assert_eq!(clamp_read_range(5, 10, 4096), (5, 5));
-        assert_eq!(clamp_read_range(5, 5, 4096), (5, 5));
-        assert_eq!(clamp_read_range(0, 0, 4096), (0, 0));
-    }
-
-    #[test]
-    fn read_range_is_truncated_at_eof() {
-        assert_eq!(clamp_read_range(5, 0, 4096), (0, 5));
-        assert_eq!(clamp_read_range(5, 2, 2), (2, 4));
-        assert_eq!(clamp_read_range(5, 2, 100), (2, 5));
-    }
-
-    #[test]
-    fn read_range_rejects_negative_offset() {
-        assert_eq!(clamp_read_range(5, -1, 4096), (0, 5));
-    }
-
-    #[test]
-    fn read_range_does_not_overflow() {
-        assert_eq!(clamp_read_range(5, i64::MAX, u32::MAX), (5, 5));
-    }
 
     #[test]
     fn concurrent_writes_to_one_inode_do_not_lose_data() {
@@ -714,9 +611,19 @@ mod tests {
 
             let guard = inner.read().unwrap();
             let entry = guard.entries.get(&ino).unwrap();
-            let ciphertext = std::fs::read(guard.data_path(ino)).unwrap();
-            let plaintext = decrypt_file_content(crypto.as_ref(), entry, &ciphertext).unwrap();
+            let content_key =
+                decrypt_content_key(crypto.as_ref(), &entry.content_key, entry.ino).unwrap();
+            let plaintext = blocks::read_range(
+                crypto.as_ref(),
+                content_key.as_slice(),
+                &guard.data_path(ino),
+                entry.size,
+                0,
+                entry.size as usize,
+            )
+            .unwrap();
 
+            assert_eq!(entry.size, 4096 + 1024);
             assert_eq!(plaintext.len(), 4096 + 1024);
             assert!(plaintext[0..1024].iter().all(|b| *b == b'A'));
             assert!(plaintext[4096..5120].iter().all(|b| *b == b'B'));
