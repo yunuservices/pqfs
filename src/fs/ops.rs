@@ -200,11 +200,7 @@ impl PqfsInner {
             (ino, FileType::Directory, ".".to_string()),
             (parent.parent, FileType::Directory, "..".to_string()),
         ];
-        for child in self
-            .entries
-            .values()
-            .filter(|e| e.parent == ino && e.ino != ino)
-        {
+        for child in self.child_inodes(ino) {
             let name = match crypto.decrypt_filename(&child.name_encrypted) {
                 Ok(n) => n,
                 Err(e) => {
@@ -277,7 +273,7 @@ impl PqfsInner {
             times: Timestamps::now(),
         };
 
-        self.entries.insert(ino, entry.clone());
+        self.insert_entry(entry.clone());
         if let Err(e) = self.save_index(crypto) {
             error!("index save error: {}", e);
             reply.error(EIO);
@@ -325,7 +321,7 @@ impl PqfsInner {
             times: Timestamps::now(),
         };
 
-        self.entries.insert(ino, entry.clone());
+        self.insert_entry(entry.clone());
         if let Err(e) = self.save_index(crypto) {
             error!("index save error: {}", e);
             reply.error(EIO);
@@ -346,7 +342,7 @@ impl PqfsInner {
             return;
         }
 
-        self.entries.remove(&entry.ino);
+        self.remove_entry(entry.ino);
         let data_path = self.data_path(entry.ino);
         if data_path.exists()
             && let Err(e) = fs::remove_file(&data_path)
@@ -370,12 +366,12 @@ impl PqfsInner {
             reply.error(ENOTDIR);
             return;
         }
-        if self.entries.values().any(|e| e.parent == entry.ino) {
+        if self.has_children(entry.ino) {
             reply.error(ENOTEMPTY);
             return;
         }
 
-        self.entries.remove(&entry.ino);
+        self.remove_entry(entry.ino);
         if let Err(e) = self.save_index(crypto) {
             error!("index save error: {}", e);
             reply.error(EIO);
@@ -484,7 +480,7 @@ impl PqfsInner {
         {
             match (&source.kind, &existing.kind) {
                 (EntryKind::Dir, EntryKind::Dir) => {
-                    if self.entries.values().any(|e| e.parent == existing.ino) {
+                    if self.has_children(existing.ino) {
                         reply.error(ENOTEMPTY);
                         return;
                     }
@@ -500,7 +496,7 @@ impl PqfsInner {
                 (EntryKind::File, EntryKind::File) => {}
             }
 
-            self.entries.remove(&existing.ino);
+            self.remove_entry(existing.ino);
             let data_path = self.data_path(existing.ino);
             if data_path.exists()
                 && let Err(e) = fs::remove_file(&data_path)
@@ -520,12 +516,7 @@ impl PqfsInner {
             }
         };
 
-        if let Some(entry) = self.entries.get_mut(&source.ino) {
-            entry.parent = newparent;
-            entry.name_hash = name_hash;
-            entry.name_encrypted = name_encrypted;
-            entry.times.touch_changed();
-        }
+        self.relink(source.ino, newparent, name_hash, name_encrypted);
 
         if let Err(e) = self.save_index(crypto) {
             error!("index save error: {}", e);
@@ -675,22 +666,19 @@ mod tests {
             let crypto = Arc::new(Crypto::init_for_tests("pw", dir.path()).unwrap());
             let mut inner = PqfsInner::load(dir.path().to_path_buf(), &crypto).unwrap();
             let ino = inner.allocate_ino();
-            inner.entries.insert(
+            inner.insert_entry(Entry {
                 ino,
-                Entry {
-                    ino,
-                    parent: 1,
-                    name_hash: [0u8; 32],
-                    name_encrypted: Vec::new(),
-                    content_key: Vec::new(),
-                    kind: EntryKind::File,
-                    size: 0,
-                    perm: 0o644,
-                    uid: 0,
-                    gid: 0,
-                    times: Timestamps::now(),
-                },
-            );
+                parent: 1,
+                name_hash: [0u8; 32],
+                name_encrypted: Vec::new(),
+                content_key: Vec::new(),
+                kind: EntryKind::File,
+                size: 0,
+                perm: 0o644,
+                uid: 0,
+                gid: 0,
+                times: Timestamps::now(),
+            });
             let data_path = inner.data_path(ino);
             let inner = Arc::new(RwLock::new(inner));
             let lock = Arc::new(RwLock::new(()));

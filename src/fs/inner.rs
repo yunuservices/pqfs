@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::ffi::OsStr;
 use std::fs;
 use std::io::Write;
@@ -17,6 +17,8 @@ pub(crate) struct PqfsInner {
     pub(crate) backend: PathBuf,
     pub(crate) entries: BTreeMap<u64, Entry>,
     pub(crate) next_ino: u64,
+    children: HashMap<(u64, [u8; 32]), u64>,
+    by_parent: HashMap<u64, BTreeSet<u64>>,
 }
 
 impl PqfsInner {
@@ -57,11 +59,97 @@ impl PqfsInner {
             (map, FUSE_ROOT_ID + 1)
         };
 
-        Ok(Self {
+        let mut this = Self {
             backend,
             entries,
             next_ino,
-        })
+            children: HashMap::new(),
+            by_parent: HashMap::new(),
+        };
+        this.rebuild_indexes();
+        Ok(this)
+    }
+
+    fn rebuild_indexes(&mut self) {
+        self.children.clear();
+        self.by_parent.clear();
+        let links: Vec<(u64, u64, [u8; 32])> = self
+            .entries
+            .values()
+            .filter(|e| e.ino != FUSE_ROOT_ID)
+            .map(|e| (e.ino, e.parent, e.name_hash))
+            .collect();
+        for (ino, parent, name_hash) in links {
+            self.link(ino, parent, name_hash);
+        }
+    }
+
+    fn link(&mut self, ino: u64, parent: u64, name_hash: [u8; 32]) {
+        self.children.insert((parent, name_hash), ino);
+        self.by_parent.entry(parent).or_default().insert(ino);
+    }
+
+    fn unlink_index(&mut self, ino: u64, parent: u64, name_hash: [u8; 32]) {
+        if self.children.get(&(parent, name_hash)) == Some(&ino) {
+            self.children.remove(&(parent, name_hash));
+        }
+        if let Some(set) = self.by_parent.get_mut(&parent) {
+            set.remove(&ino);
+            if set.is_empty() {
+                self.by_parent.remove(&parent);
+            }
+        }
+    }
+
+    pub(crate) fn insert_entry(&mut self, entry: Entry) {
+        if let Some(previous) = self.entries.get(&entry.ino) {
+            let (parent, name_hash) = (previous.parent, previous.name_hash);
+            self.unlink_index(entry.ino, parent, name_hash);
+        }
+        if entry.ino != FUSE_ROOT_ID {
+            self.link(entry.ino, entry.parent, entry.name_hash);
+        }
+        self.entries.insert(entry.ino, entry);
+    }
+
+    pub(crate) fn remove_entry(&mut self, ino: u64) -> Option<Entry> {
+        let entry = self.entries.remove(&ino)?;
+        self.unlink_index(ino, entry.parent, entry.name_hash);
+        Some(entry)
+    }
+
+    pub(crate) fn relink(
+        &mut self,
+        ino: u64,
+        new_parent: u64,
+        new_name_hash: [u8; 32],
+        new_name_encrypted: Vec<u8>,
+    ) {
+        let Some(entry) = self.entries.get(&ino) else {
+            return;
+        };
+        let (parent, name_hash) = (entry.parent, entry.name_hash);
+        self.unlink_index(ino, parent, name_hash);
+
+        if let Some(entry) = self.entries.get_mut(&ino) {
+            entry.parent = new_parent;
+            entry.name_hash = new_name_hash;
+            entry.name_encrypted = new_name_encrypted;
+            entry.times.touch_changed();
+        }
+        self.link(ino, new_parent, new_name_hash);
+    }
+
+    pub(crate) fn child_inodes(&self, parent: u64) -> impl Iterator<Item = &Entry> {
+        self.by_parent
+            .get(&parent)
+            .into_iter()
+            .flatten()
+            .filter_map(|ino| self.entries.get(ino))
+    }
+
+    pub(crate) fn has_children(&self, parent: u64) -> bool {
+        self.by_parent.get(&parent).is_some_and(|s| !s.is_empty())
     }
 
     pub(crate) fn save_index(&mut self, crypto: &Crypto) -> Result<()> {
@@ -111,16 +199,12 @@ impl PqfsInner {
     pub(crate) fn find_child(&self, crypto: &Crypto, parent: u64, name: &OsStr) -> Option<&Entry> {
         let name = name.to_string_lossy();
         let hash = crypto.hash_filename(&name);
-        self.entries.values().find(|e| {
-            if e.parent != parent || e.name_hash != hash {
-                return false;
-            }
-            // Verify with decryption to rule out hash collisions.
-            crypto
-                .decrypt_filename(&e.name_encrypted)
-                .map(|decrypted| decrypted == name.as_ref())
-                .unwrap_or(false)
-        })
+        let entry = self.entries.get(self.children.get(&(parent, hash))?)?;
+        crypto
+            .decrypt_filename(&entry.name_encrypted)
+            .ok()
+            .filter(|decrypted| decrypted == name.as_ref())
+            .map(|_| entry)
     }
 
     pub(crate) fn allocate_ino(&mut self) -> u64 {
@@ -174,22 +258,19 @@ mod tests {
         let first = inner.allocate_ino();
         assert_eq!(first, FUSE_ROOT_ID + 1);
 
-        inner.entries.insert(
-            first,
-            Entry {
-                ino: first,
-                parent: FUSE_ROOT_ID,
-                name_hash: [0u8; 32],
-                name_encrypted: Vec::new(),
-                content_key: Vec::new(),
-                kind: EntryKind::File,
-                size: 0,
-                perm: 0o644,
-                uid: 0,
-                gid: 0,
-                times: Timestamps::now(),
-            },
-        );
+        inner.insert_entry(Entry {
+            ino: first,
+            parent: FUSE_ROOT_ID,
+            name_hash: [0u8; 32],
+            name_encrypted: Vec::new(),
+            content_key: Vec::new(),
+            kind: EntryKind::File,
+            size: 0,
+            perm: 0o644,
+            uid: 0,
+            gid: 0,
+            times: Timestamps::now(),
+        });
 
         inner.save_index(&crypto).unwrap();
         let reloaded = PqfsInner::load(dir.path().to_path_buf(), &crypto).unwrap();
@@ -206,22 +287,19 @@ mod tests {
         let mut times = Timestamps::now();
         times.mtime = 1_700_000_000_000_000_000;
         times.crtime = 1_600_000_000_000_000_000;
-        inner.entries.insert(
+        inner.insert_entry(Entry {
             ino,
-            Entry {
-                ino,
-                parent: FUSE_ROOT_ID,
-                name_hash: [0u8; 32],
-                name_encrypted: Vec::new(),
-                content_key: Vec::new(),
-                kind: EntryKind::File,
-                size: 0,
-                perm: 0o644,
-                uid: 0,
-                gid: 0,
-                times,
-            },
-        );
+            parent: FUSE_ROOT_ID,
+            name_hash: [0u8; 32],
+            name_encrypted: Vec::new(),
+            content_key: Vec::new(),
+            kind: EntryKind::File,
+            size: 0,
+            perm: 0o644,
+            uid: 0,
+            gid: 0,
+            times,
+        });
 
         let attr = inner.attr_for(inner.entries.get(&ino).unwrap());
         assert_eq!(attr.mtime, to_system_time(times.mtime));
@@ -250,26 +328,139 @@ mod tests {
         let a = inner.allocate_ino();
         let b = inner.allocate_ino();
         for (ino, parent) in [(a, FUSE_ROOT_ID), (b, a)] {
-            inner.entries.insert(
+            inner.insert_entry(Entry {
                 ino,
-                Entry {
-                    ino,
-                    parent,
-                    name_hash: [0u8; 32],
-                    name_encrypted: Vec::new(),
-                    content_key: Vec::new(),
-                    kind: EntryKind::Dir,
-                    size: 0,
-                    perm: 0o755,
-                    uid: 0,
-                    gid: 0,
-                    times: Timestamps::now(),
-                },
-            );
+                parent,
+                name_hash: [0u8; 32],
+                name_encrypted: Vec::new(),
+                content_key: Vec::new(),
+                kind: EntryKind::Dir,
+                size: 0,
+                perm: 0o755,
+                uid: 0,
+                gid: 0,
+                times: Timestamps::now(),
+            });
         }
 
         assert!(inner.is_descendant_of(b, a));
         assert!(!inner.is_descendant_of(a, b));
         assert!(!inner.is_descendant_of(FUSE_ROOT_ID, a));
+    }
+
+    #[test]
+    fn child_index_survives_a_reload() {
+        let (dir, crypto) = setup();
+        let mut inner = PqfsInner::load(dir.path().to_path_buf(), &crypto).unwrap();
+
+        let ino = inner.allocate_ino();
+        let name = "belge.txt";
+        inner.insert_entry(Entry {
+            ino,
+            parent: FUSE_ROOT_ID,
+            name_hash: crypto.hash_filename(name),
+            name_encrypted: crypto.encrypt_filename(name).unwrap(),
+            content_key: Vec::new(),
+            kind: EntryKind::File,
+            size: 0,
+            perm: 0o644,
+            uid: 0,
+            gid: 0,
+            times: Timestamps::now(),
+        });
+        inner.save_index(&crypto).unwrap();
+
+        let reloaded = PqfsInner::load(dir.path().to_path_buf(), &crypto).unwrap();
+        let found = reloaded
+            .find_child(&crypto, FUSE_ROOT_ID, std::ffi::OsStr::new(name))
+            .unwrap();
+        assert_eq!(found.ino, ino);
+        assert_eq!(reloaded.child_inodes(FUSE_ROOT_ID).count(), 1);
+        assert!(reloaded.has_children(FUSE_ROOT_ID));
+        assert!(!reloaded.has_children(ino));
+    }
+
+    #[test]
+    fn relink_moves_the_child_index_entry() {
+        let (dir, crypto) = setup();
+        let mut inner = PqfsInner::load(dir.path().to_path_buf(), &crypto).unwrap();
+
+        let target_dir = inner.allocate_ino();
+        inner.insert_entry(Entry {
+            ino: target_dir,
+            parent: FUSE_ROOT_ID,
+            name_hash: crypto.hash_filename("d"),
+            name_encrypted: crypto.encrypt_filename("d").unwrap(),
+            content_key: Vec::new(),
+            kind: EntryKind::Dir,
+            size: 0,
+            perm: 0o755,
+            uid: 0,
+            gid: 0,
+            times: Timestamps::now(),
+        });
+
+        let ino = inner.allocate_ino();
+        inner.insert_entry(Entry {
+            ino,
+            parent: FUSE_ROOT_ID,
+            name_hash: crypto.hash_filename("eski"),
+            name_encrypted: crypto.encrypt_filename("eski").unwrap(),
+            content_key: Vec::new(),
+            kind: EntryKind::File,
+            size: 0,
+            perm: 0o644,
+            uid: 0,
+            gid: 0,
+            times: Timestamps::now(),
+        });
+
+        inner.relink(
+            ino,
+            target_dir,
+            crypto.hash_filename("yeni"),
+            crypto.encrypt_filename("yeni").unwrap(),
+        );
+
+        assert!(
+            inner
+                .find_child(&crypto, FUSE_ROOT_ID, std::ffi::OsStr::new("eski"))
+                .is_none()
+        );
+        let moved = inner
+            .find_child(&crypto, target_dir, std::ffi::OsStr::new("yeni"))
+            .unwrap();
+        assert_eq!(moved.ino, ino);
+        assert_eq!(inner.child_inodes(target_dir).count(), 1);
+    }
+
+    #[test]
+    fn remove_entry_clears_the_child_index() {
+        let (dir, crypto) = setup();
+        let mut inner = PqfsInner::load(dir.path().to_path_buf(), &crypto).unwrap();
+
+        let ino = inner.allocate_ino();
+        inner.insert_entry(Entry {
+            ino,
+            parent: FUSE_ROOT_ID,
+            name_hash: crypto.hash_filename("x"),
+            name_encrypted: crypto.encrypt_filename("x").unwrap(),
+            content_key: Vec::new(),
+            kind: EntryKind::File,
+            size: 0,
+            perm: 0o644,
+            uid: 0,
+            gid: 0,
+            times: Timestamps::now(),
+        });
+        assert!(inner.has_children(FUSE_ROOT_ID));
+
+        inner.remove_entry(ino).unwrap();
+        assert!(!inner.has_children(FUSE_ROOT_ID));
+        assert!(
+            inner
+                .find_child(&crypto, FUSE_ROOT_ID, std::ffi::OsStr::new("x"))
+                .is_none()
+        );
     }
 }
