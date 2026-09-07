@@ -341,6 +341,11 @@ impl PqfsInner {
             return;
         };
 
+        if matches!(entry.kind, EntryKind::Dir) {
+            reply.error(EISDIR);
+            return;
+        }
+
         self.entries.remove(&entry.ino);
         let data_path = self.data_path(entry.ino);
         if data_path.exists()
