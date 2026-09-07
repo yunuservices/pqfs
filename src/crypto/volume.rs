@@ -8,6 +8,7 @@ use chacha20poly1305::{Key, XChaCha20Poly1305, XNonce};
 use ml_kem::Seed;
 use ml_kem::kem::{Ciphertext, Decapsulate, Encapsulate, Kem, KeyExport};
 use rand::Rng;
+use zeroize::Zeroizing;
 
 use super::keys::{
     derive_header_mac_key, derive_master_key, derive_password_key, header_mac, random_nonce,
@@ -47,7 +48,7 @@ impl Crypto {
         let (ct, shared_secret) = ek.encapsulate();
 
         let seed = dk.to_seed().context("failed to extract ML-KEM seed")?;
-        let seed_bytes: Vec<u8> = AsRef::<[u8]>::as_ref(&seed).to_vec();
+        let seed_bytes = Zeroizing::new(AsRef::<[u8]>::as_ref(&seed).to_vec());
         let sk_nonce = random_nonce();
         let encrypted_seed = pw_cipher
             .encrypt(&sk_nonce, seed_bytes.as_ref())
@@ -57,7 +58,10 @@ impl Crypto {
         encrypted_seed_blob.extend_from_slice(sk_nonce.as_ref());
         encrypted_seed_blob.extend_from_slice(&encrypted_seed);
 
-        let master_key = derive_master_key(&password_key, AsRef::<[u8]>::as_ref(&shared_secret))?;
+        let master_key = derive_master_key(
+            password_key.as_slice(),
+            AsRef::<[u8]>::as_ref(&shared_secret),
+        )?;
 
         let mut header = VolumeHeader {
             version: HEADER_VERSION,
@@ -70,10 +74,10 @@ impl Crypto {
             mac: [0u8; MAC_LEN],
         };
 
-        let mac_key = derive_header_mac_key(&password_key)?;
-        header.mac = header_mac(&mac_key, &header)?;
+        let mac_key = derive_header_mac_key(password_key.as_slice())?;
+        header.mac = header_mac(mac_key.as_slice(), &header)?;
 
-        let this = Self::from_master_key(&master_key, header)?;
+        let this = Self::from_master_key(master_key.as_slice(), header)?;
         this.save(backend)?;
         Ok(this)
     }
@@ -124,8 +128,8 @@ impl Crypto {
 
         let password_key = derive_password_key(password, &header.salt, header.kdf)?;
 
-        let mac_key = derive_header_mac_key(&password_key)?;
-        verify_header_mac(&mac_key, &header)?;
+        let mac_key = derive_header_mac_key(password_key.as_slice())?;
+        verify_header_mac(mac_key.as_slice(), &header)?;
 
         let pw_key = Key::try_from(password_key.as_slice())
             .map_err(|_| anyhow::anyhow!("invalid password key length"))?;
@@ -137,9 +141,11 @@ impl Crypto {
         let (nonce, ct) = header.encrypted_seed.split_at(NONCE_LEN);
         let nonce =
             XNonce::try_from(nonce).map_err(|_| anyhow::anyhow!("invalid seed nonce length"))?;
-        let seed_bytes = pw_cipher
-            .decrypt(&nonce, ct)
-            .context("password incorrect or corrupted volume")?;
+        let seed_bytes = Zeroizing::new(
+            pw_cipher
+                .decrypt(&nonce, ct)
+                .context("password incorrect or corrupted volume")?,
+        );
 
         if seed_bytes.len() != SEED_LEN {
             bail!("invalid ML-KEM seed length");
@@ -152,9 +158,12 @@ impl Crypto {
             .map_err(|_| anyhow::anyhow!("invalid ML-KEM ciphertext"))?;
         let shared_secret = dk.decapsulate(&ct_array);
 
-        let master_key = derive_master_key(&password_key, AsRef::<[u8]>::as_ref(&shared_secret))?;
+        let master_key = derive_master_key(
+            password_key.as_slice(),
+            AsRef::<[u8]>::as_ref(&shared_secret),
+        )?;
 
-        Self::from_master_key(&master_key, header)
+        Self::from_master_key(master_key.as_slice(), header)
     }
 
     fn save(&self, backend: &Path) -> Result<()> {

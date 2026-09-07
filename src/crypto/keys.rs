@@ -7,7 +7,11 @@ use hmac::{Hmac, Mac};
 use rand::Rng;
 use sha2::Sha256;
 
+use zeroize::Zeroizing;
+
 use super::{Crypto, KEY_LEN, KdfParams, MAC_LEN, NONCE_LEN, SALT_LEN, VolumeHeader};
+
+pub(crate) type SecretKey = Zeroizing<[u8; KEY_LEN]>;
 
 pub(crate) fn random_nonce() -> XNonce {
     let mut nonce = [0u8; NONCE_LEN];
@@ -24,38 +28,35 @@ pub(crate) fn derive_password_key(
     password: &str,
     salt: &[u8],
     kdf: KdfParams,
-) -> Result<[u8; KEY_LEN]> {
+) -> Result<SecretKey> {
     if salt.len() != SALT_LEN {
         bail!("invalid salt length");
     }
     let params = Params::new(kdf.m_cost, kdf.t_cost, kdf.p_cost, Some(KEY_LEN))
         .map_err(|e| anyhow::anyhow!("invalid Argon2 parameters: {}", e))?;
     let argon2 = Argon2::new(Algorithm::Argon2id, ArgonVersion::V0x13, params);
-    let mut out = [0u8; KEY_LEN];
+    let mut out = Zeroizing::new([0u8; KEY_LEN]);
     argon2
-        .hash_password_into(password.as_bytes(), salt, &mut out)
+        .hash_password_into(password.as_bytes(), salt, out.as_mut_slice())
         .map_err(|e| anyhow::anyhow!("Argon2 key derivation failed: {}", e))?;
     Ok(out)
 }
 
-pub(crate) fn derive_master_key(
-    password_key: &[u8],
-    shared_secret: &[u8],
-) -> Result<[u8; KEY_LEN]> {
+pub(crate) fn derive_master_key(password_key: &[u8], shared_secret: &[u8]) -> Result<SecretKey> {
     let mut ikm = Vec::with_capacity(password_key.len() + shared_secret.len());
     ikm.extend_from_slice(password_key);
     ikm.extend_from_slice(shared_secret);
     let hkdf = Hkdf::<Sha256>::new(None, &ikm);
-    let mut okm = [0u8; KEY_LEN];
-    hkdf.expand(b"pqfs-hybrid-master-key", &mut okm)
+    let mut okm = Zeroizing::new([0u8; KEY_LEN]);
+    hkdf.expand(b"pqfs-hybrid-master-key", okm.as_mut_slice())
         .map_err(|e| anyhow::anyhow!("HKDF expand failed: {}", e))?;
     Ok(okm)
 }
 
-pub(crate) fn derive_header_mac_key(password_key: &[u8]) -> Result<[u8; KEY_LEN]> {
+pub(crate) fn derive_header_mac_key(password_key: &[u8]) -> Result<SecretKey> {
     let hkdf = Hkdf::<Sha256>::new(None, password_key);
-    let mut okm = [0u8; KEY_LEN];
-    hkdf.expand(b"pqfs-header-mac-key", &mut okm)
+    let mut okm = Zeroizing::new([0u8; KEY_LEN]);
+    hkdf.expand(b"pqfs-header-mac-key", okm.as_mut_slice())
         .map_err(|e| anyhow::anyhow!("HKDF header mac key expand failed: {}", e))?;
     Ok(okm)
 }
@@ -78,13 +79,13 @@ pub(crate) fn verify_header_mac(mac_key: &[u8], header: &VolumeHeader) -> Result
         .map_err(|_| anyhow::anyhow!("password incorrect or volume header has been modified"))
 }
 
-pub(crate) fn derive_filename_keys(master_key: &[u8]) -> Result<([u8; KEY_LEN], [u8; KEY_LEN])> {
+pub(crate) fn derive_filename_keys(master_key: &[u8]) -> Result<(SecretKey, SecretKey)> {
     let hkdf = Hkdf::<Sha256>::new(None, master_key);
-    let mut filename_key = [0u8; KEY_LEN];
-    let mut filename_hash_key = [0u8; KEY_LEN];
-    hkdf.expand(b"pqfs-filename-key", &mut filename_key)
+    let mut filename_key = Zeroizing::new([0u8; KEY_LEN]);
+    let mut filename_hash_key = Zeroizing::new([0u8; KEY_LEN]);
+    hkdf.expand(b"pqfs-filename-key", filename_key.as_mut_slice())
         .map_err(|e| anyhow::anyhow!("HKDF filename key expand failed: {}", e))?;
-    hkdf.expand(b"pqfs-filename-hash-key", &mut filename_hash_key)
+    hkdf.expand(b"pqfs-filename-hash-key", filename_hash_key.as_mut_slice())
         .map_err(|e| anyhow::anyhow!("HKDF filename hash key expand failed: {}", e))?;
     Ok((filename_key, filename_hash_key))
 }
@@ -93,7 +94,7 @@ impl Crypto {
     pub(crate) fn from_master_key(master_key: &[u8], header: VolumeHeader) -> Result<Self> {
         let (filename_key, filename_hash_key) = derive_filename_keys(master_key)?;
         let cipher = build_cipher(master_key)?;
-        let filename_cipher = build_cipher(&filename_key)?;
+        let filename_cipher = build_cipher(filename_key.as_slice())?;
         Ok(Self {
             cipher,
             header,
@@ -102,9 +103,9 @@ impl Crypto {
         })
     }
 
-    pub(crate) fn random_key(&self) -> [u8; KEY_LEN] {
-        let mut key = [0u8; KEY_LEN];
-        rand::rng().fill_bytes(&mut key);
+    pub(crate) fn random_key(&self) -> SecretKey {
+        let mut key = Zeroizing::new([0u8; KEY_LEN]);
+        rand::rng().fill_bytes(key.as_mut_slice());
         key
     }
 }
@@ -143,12 +144,12 @@ mod tests {
     fn derive_master_key_is_32_bytes_and_sensitive_to_input() {
         let pw = derive_password_key("pw", &[0u8; SALT_LEN], TEST_KDF).unwrap();
         let ss = [0u8; 64];
-        let key_a = derive_master_key(&pw, &ss).unwrap();
+        let key_a = derive_master_key(pw.as_slice(), &ss).unwrap();
         assert_eq!(key_a.len(), KEY_LEN);
 
         let mut ss2 = ss;
         ss2[0] ^= 1;
-        let key_b = derive_master_key(&pw, &ss2).unwrap();
+        let key_b = derive_master_key(pw.as_slice(), &ss2).unwrap();
         assert_ne!(key_a, key_b);
     }
 

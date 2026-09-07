@@ -22,5 +22,5 @@ pub struct Crypto {
     pub(crate) cipher: XChaCha20Poly1305,
     pub(crate) header: VolumeHeader,
     pub(crate) filename_cipher: XChaCha20Poly1305,
-    pub(crate) filename_hash_key: [u8; KEY_LEN],
+    pub(crate) filename_hash_key: keys::SecretKey,
 }

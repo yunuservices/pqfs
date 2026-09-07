@@ -80,8 +80,12 @@ mod tests {
         let crypto = crypto();
         let content_key = crypto.random_key();
         let plaintext = b"per-file secret";
-        let ciphertext = crypto.encrypt_with_key(&content_key, plaintext).unwrap();
-        let decrypted = crypto.decrypt_with_key(&content_key, &ciphertext).unwrap();
+        let ciphertext = crypto
+            .encrypt_with_key(content_key.as_slice(), plaintext)
+            .unwrap();
+        let decrypted = crypto
+            .decrypt_with_key(content_key.as_slice(), &ciphertext)
+            .unwrap();
         assert_eq!(decrypted, plaintext);
     }
 

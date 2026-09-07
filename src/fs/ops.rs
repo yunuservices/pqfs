@@ -9,6 +9,7 @@ use fuser::{
 };
 use libc::{EEXIST, EIO, ENOENT, ENOTDIR, ENOTEMPTY};
 use tracing::{error, warn};
+use zeroize::Zeroizing;
 
 use super::TTL;
 use super::entry::{Entry, EntryKind};
@@ -103,7 +104,7 @@ impl PqfsInner {
 
         // Ensure this file has its own per-file key.
         let content_key_enc = if entry.content_key.is_empty() {
-            match crypto.encrypt(&crypto.random_key()) {
+            match crypto.encrypt(crypto.random_key().as_slice()) {
                 Ok(v) => v,
                 Err(e) => {
                     error!("content key encrypt error for inode {}: {}", entry.ino, e);
@@ -213,7 +214,7 @@ impl PqfsInner {
                 return;
             }
         };
-        let content_key = match crypto.encrypt(&crypto.random_key()) {
+        let content_key = match crypto.encrypt(crypto.random_key().as_slice()) {
             Ok(v) => v,
             Err(e) => {
                 error!("content key encryption error: {}", e);
@@ -377,14 +378,18 @@ impl PqfsInner {
     }
 }
 
-fn decrypt_content_key(crypto: &Crypto, content_key_enc: &[u8], ino: u64) -> Result<Vec<u8>, i32> {
+fn decrypt_content_key(
+    crypto: &Crypto,
+    content_key_enc: &[u8],
+    ino: u64,
+) -> Result<Zeroizing<Vec<u8>>, i32> {
     match crypto.decrypt(content_key_enc) {
         Ok(v) => {
             if v.len() != 32 {
                 error!("bad per-file key length for inode {}: {}", ino, v.len());
                 Err(EIO)
             } else {
-                Ok(v)
+                Ok(Zeroizing::new(v))
             }
         }
         Err(e) => {
