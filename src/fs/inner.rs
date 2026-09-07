@@ -241,4 +241,35 @@ mod tests {
         assert_eq!(before.crtime, after.crtime);
         assert_eq!(before.mtime, after.mtime);
     }
+
+    #[test]
+    fn is_descendant_detects_a_cycle_target() {
+        let (dir, crypto) = setup();
+        let mut inner = PqfsInner::load(dir.path().to_path_buf(), &crypto).unwrap();
+
+        let a = inner.allocate_ino();
+        let b = inner.allocate_ino();
+        for (ino, parent) in [(a, FUSE_ROOT_ID), (b, a)] {
+            inner.entries.insert(
+                ino,
+                Entry {
+                    ino,
+                    parent,
+                    name_hash: [0u8; 32],
+                    name_encrypted: Vec::new(),
+                    content_key: Vec::new(),
+                    kind: EntryKind::Dir,
+                    size: 0,
+                    perm: 0o755,
+                    uid: 0,
+                    gid: 0,
+                    times: Timestamps::now(),
+                },
+            );
+        }
+
+        assert!(inner.is_descendant_of(b, a));
+        assert!(!inner.is_descendant_of(a, b));
+        assert!(!inner.is_descendant_of(FUSE_ROOT_ID, a));
+    }
 }

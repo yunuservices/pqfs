@@ -4,10 +4,10 @@ use std::io;
 use std::path::PathBuf;
 
 use fuser::{
-    FileType, ReplyAttr, ReplyCreate, ReplyData, ReplyDirectory, ReplyEmpty, ReplyEntry, ReplyOpen,
-    ReplyWrite,
+    FUSE_ROOT_ID, FileType, ReplyAttr, ReplyCreate, ReplyData, ReplyDirectory, ReplyEmpty,
+    ReplyEntry, ReplyOpen, ReplyWrite, TimeOrNow,
 };
-use libc::{EEXIST, EIO, ENOENT, ENOTDIR, ENOTEMPTY};
+use libc::{EEXIST, EINVAL, EIO, EISDIR, ENOENT, ENOTDIR, ENOTEMPTY};
 use tracing::{error, warn};
 use zeroize::Zeroizing;
 
@@ -135,6 +135,43 @@ impl PqfsInner {
             }
         };
 
+        if let Err(e) = fs::write(&data_path, ciphertext) {
+            error!("write error for {}: {}", data_path.display(), e);
+            return Err(EIO);
+        }
+
+        Ok((content_key_enc, plaintext.len() as u64))
+    }
+
+    pub(crate) fn do_truncate(
+        crypto: &Crypto,
+        entry: &Entry,
+        data_path: PathBuf,
+        size: u64,
+    ) -> Result<(Vec<u8>, u64), i32> {
+        let mut plaintext = Self::read_existing_plaintext(crypto, entry, data_path.clone())?;
+        plaintext.resize(size as usize, 0);
+
+        let content_key_enc = if entry.content_key.is_empty() {
+            match crypto.encrypt(crypto.random_key().as_slice()) {
+                Ok(v) => v,
+                Err(e) => {
+                    error!("content key encrypt error for inode {}: {}", entry.ino, e);
+                    return Err(EIO);
+                }
+            }
+        } else {
+            entry.content_key.clone()
+        };
+        let content_key = decrypt_content_key(crypto, &content_key_enc, entry.ino)?;
+
+        let ciphertext = match crypto.encrypt_with_key(&content_key, &plaintext) {
+            Ok(v) => v,
+            Err(e) => {
+                error!("encrypt error for {}: {}", data_path.display(), e);
+                return Err(EIO);
+            }
+        };
         if let Err(e) = fs::write(&data_path, ciphertext) {
             error!("write error for {}: {}", data_path.display(), e);
             return Err(EIO);
@@ -338,6 +375,157 @@ impl PqfsInner {
         reply.ok();
     }
 
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn apply_setattr(
+        &mut self,
+        crypto: &Crypto,
+        ino: u64,
+        mode: Option<u32>,
+        uid: Option<u32>,
+        gid: Option<u32>,
+        atime: Option<TimeOrNow>,
+        mtime: Option<TimeOrNow>,
+        truncated: Option<(Vec<u8>, u64)>,
+        reply: ReplyAttr,
+    ) {
+        let Some(entry) = self.entries.get_mut(&ino) else {
+            reply.error(ENOENT);
+            return;
+        };
+
+        if let Some(mode) = mode {
+            entry.perm = (mode as u16) & 0o777;
+        }
+        if let Some(uid) = uid {
+            entry.uid = uid;
+        }
+        if let Some(gid) = gid {
+            entry.gid = gid;
+        }
+        if let Some(atime) = atime {
+            entry.times.atime = time_or_now_nanos(atime);
+        }
+        if let Some(mtime) = mtime {
+            entry.times.mtime = time_or_now_nanos(mtime);
+        }
+        if let Some((content_key, size)) = truncated {
+            entry.content_key = content_key;
+            entry.size = size;
+            entry.times.touch_modified();
+        }
+        entry.times.touch_changed();
+
+        let entry = entry.clone();
+        if let Err(e) = self.save_index(crypto) {
+            error!("index save error: {}", e);
+            reply.error(EIO);
+            return;
+        }
+        reply.attr(&TTL, &self.attr_for(&entry));
+    }
+
+    pub(crate) fn is_descendant_of(&self, mut ino: u64, ancestor: u64) -> bool {
+        let mut hops = 0;
+        while ino != FUSE_ROOT_ID && hops < self.entries.len() + 1 {
+            if ino == ancestor {
+                return true;
+            }
+            match self.entries.get(&ino) {
+                Some(entry) => ino = entry.parent,
+                None => return false,
+            }
+            hops += 1;
+        }
+        ino == ancestor
+    }
+
+    pub(crate) fn rename(
+        &mut self,
+        crypto: &Crypto,
+        parent: u64,
+        name: &OsStr,
+        newparent: u64,
+        newname: &OsStr,
+        reply: ReplyEmpty,
+    ) {
+        let Some(source) = self.find_child(crypto, parent, name).cloned() else {
+            reply.error(ENOENT);
+            return;
+        };
+
+        match self.entries.get(&newparent) {
+            Some(entry) if matches!(entry.kind, EntryKind::Dir) => {}
+            Some(_) => {
+                reply.error(ENOTDIR);
+                return;
+            }
+            None => {
+                reply.error(ENOENT);
+                return;
+            }
+        }
+
+        if matches!(source.kind, EntryKind::Dir) && self.is_descendant_of(newparent, source.ino) {
+            reply.error(EINVAL);
+            return;
+        }
+
+        if let Some(existing) = self.find_child(crypto, newparent, newname).cloned()
+            && existing.ino != source.ino
+        {
+            match (&source.kind, &existing.kind) {
+                (EntryKind::Dir, EntryKind::Dir) => {
+                    if self.entries.values().any(|e| e.parent == existing.ino) {
+                        reply.error(ENOTEMPTY);
+                        return;
+                    }
+                }
+                (EntryKind::Dir, EntryKind::File) => {
+                    reply.error(ENOTDIR);
+                    return;
+                }
+                (EntryKind::File, EntryKind::Dir) => {
+                    reply.error(EISDIR);
+                    return;
+                }
+                (EntryKind::File, EntryKind::File) => {}
+            }
+
+            self.entries.remove(&existing.ino);
+            let data_path = self.data_path(existing.ino);
+            if data_path.exists()
+                && let Err(e) = fs::remove_file(&data_path)
+            {
+                warn!("failed to remove data file {}: {}", data_path.display(), e);
+            }
+        }
+
+        let newname = newname.to_string_lossy().to_string();
+        let name_hash = crypto.hash_filename(&newname);
+        let name_encrypted = match crypto.encrypt_filename(&newname) {
+            Ok(v) => v,
+            Err(e) => {
+                error!("filename encryption error: {}", e);
+                reply.error(EIO);
+                return;
+            }
+        };
+
+        if let Some(entry) = self.entries.get_mut(&source.ino) {
+            entry.parent = newparent;
+            entry.name_hash = name_hash;
+            entry.name_encrypted = name_encrypted;
+            entry.times.touch_changed();
+        }
+
+        if let Err(e) = self.save_index(crypto) {
+            error!("index save error: {}", e);
+            reply.error(EIO);
+            return;
+        }
+        reply.ok();
+    }
+
     pub(crate) fn open(&self, ino: u64, reply: ReplyOpen) {
         if self.entries.contains_key(&ino) {
             reply.opened(0, 0);
@@ -428,6 +616,16 @@ fn clamp_read_range(len: usize, offset: i64, size: u32) -> (usize, usize) {
     let start = usize::try_from(offset).unwrap_or(0).min(len);
     let end = start.saturating_add(size as usize).min(len);
     (start, end)
+}
+
+fn time_or_now_nanos(value: TimeOrNow) -> u64 {
+    match value {
+        TimeOrNow::SpecificTime(time) => time
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos() as u64)
+            .unwrap_or(0),
+        TimeOrNow::Now => crate::fs::entry::now_nanos(),
+    }
 }
 
 #[cfg(test)]

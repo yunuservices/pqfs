@@ -17,6 +17,10 @@ pub(crate) struct Timestamps {
 }
 
 impl Timestamps {
+    pub(crate) fn touch_changed(&mut self) {
+        self.ctime = now_nanos();
+    }
+
     pub(crate) fn now() -> Self {
         let now = now_nanos();
         Self {
