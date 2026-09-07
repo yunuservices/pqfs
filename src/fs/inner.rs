@@ -3,12 +3,11 @@ use std::ffi::OsStr;
 use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
-use std::time::SystemTime;
 
 use anyhow::{Context, Result};
 use fuser::{FUSE_ROOT_ID, FileAttr, FileType};
 
-use super::entry::{Entry, EntryKind};
+use super::entry::{Entry, EntryKind, Timestamps, to_system_time};
 use super::{BLOCK_SIZE, INDEX_FILE};
 use crate::crypto::Crypto;
 
@@ -52,6 +51,7 @@ impl PqfsInner {
                     perm: 0o755,
                     uid: unsafe { libc::getuid() },
                     gid: unsafe { libc::getgid() },
+                    times: Timestamps::now(),
                 },
             );
             (map, FUSE_ROOT_ID + 1)
@@ -82,15 +82,14 @@ impl PqfsInner {
     }
 
     pub(crate) fn attr_for(&self, entry: &Entry) -> FileAttr {
-        let now = SystemTime::now();
         FileAttr {
             ino: entry.ino,
             size: entry.size,
             blocks: entry.size.div_ceil(BLOCK_SIZE),
-            atime: now,
-            mtime: now,
-            ctime: now,
-            crtime: now,
+            atime: to_system_time(entry.times.atime),
+            mtime: to_system_time(entry.times.mtime),
+            ctime: to_system_time(entry.times.ctime),
+            crtime: to_system_time(entry.times.crtime),
             kind: match entry.kind {
                 EntryKind::File => FileType::RegularFile,
                 EntryKind::Dir => FileType::Directory,
@@ -188,6 +187,7 @@ mod tests {
                 perm: 0o644,
                 uid: 0,
                 gid: 0,
+                times: Timestamps::now(),
             },
         );
 
@@ -196,5 +196,49 @@ mod tests {
         assert!(reloaded.entries.contains_key(&FUSE_ROOT_ID));
         assert!(reloaded.entries.contains_key(&first));
         assert_eq!(reloaded.next_ino, inner.next_ino);
+    }
+
+    #[test]
+    fn attr_reports_stored_timestamps() {
+        let (dir, crypto) = setup();
+        let mut inner = PqfsInner::load(dir.path().to_path_buf(), &crypto).unwrap();
+        let ino = inner.allocate_ino();
+        let mut times = Timestamps::now();
+        times.mtime = 1_700_000_000_000_000_000;
+        times.crtime = 1_600_000_000_000_000_000;
+        inner.entries.insert(
+            ino,
+            Entry {
+                ino,
+                parent: FUSE_ROOT_ID,
+                name_hash: [0u8; 32],
+                name_encrypted: Vec::new(),
+                content_key: Vec::new(),
+                kind: EntryKind::File,
+                size: 0,
+                perm: 0o644,
+                uid: 0,
+                gid: 0,
+                times,
+            },
+        );
+
+        let attr = inner.attr_for(inner.entries.get(&ino).unwrap());
+        assert_eq!(attr.mtime, to_system_time(times.mtime));
+        assert_eq!(attr.crtime, to_system_time(times.crtime));
+        assert_ne!(attr.mtime, attr.crtime);
+    }
+
+    #[test]
+    fn timestamps_survive_an_index_reload() {
+        let (dir, crypto) = setup();
+        let mut inner = PqfsInner::load(dir.path().to_path_buf(), &crypto).unwrap();
+        let before = inner.entries.get(&FUSE_ROOT_ID).unwrap().times;
+        inner.save_index(&crypto).unwrap();
+
+        let reloaded = PqfsInner::load(dir.path().to_path_buf(), &crypto).unwrap();
+        let after = reloaded.entries.get(&FUSE_ROOT_ID).unwrap().times;
+        assert_eq!(before.crtime, after.crtime);
+        assert_eq!(before.mtime, after.mtime);
     }
 }

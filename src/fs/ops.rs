@@ -12,7 +12,7 @@ use tracing::{error, warn};
 use zeroize::Zeroizing;
 
 use super::TTL;
-use super::entry::{Entry, EntryKind};
+use super::entry::{Entry, EntryKind, Timestamps};
 use super::inner::PqfsInner;
 use crate::crypto::Crypto;
 
@@ -233,6 +233,7 @@ impl PqfsInner {
             perm: (mode as u16) & 0o777,
             uid: unsafe { libc::getuid() },
             gid: unsafe { libc::getgid() },
+            times: Timestamps::now(),
         };
 
         self.entries.insert(ino, entry.clone());
@@ -280,6 +281,7 @@ impl PqfsInner {
             perm: (mode as u16) & 0o777,
             uid: unsafe { libc::getuid() },
             gid: unsafe { libc::getgid() },
+            times: Timestamps::now(),
         };
 
         self.entries.insert(ino, entry.clone());
@@ -361,6 +363,7 @@ impl PqfsInner {
         if let Some(e) = self.entries.get_mut(&ino) {
             e.content_key = content_key_enc;
             e.size = size;
+            e.times.touch_modified();
         } else {
             // Entry was removed while the write was in flight. The data file
             // is already on disk; report success because the write completed.
@@ -478,6 +481,7 @@ mod tests {
                     perm: 0o644,
                     uid: 0,
                     gid: 0,
+                    times: Timestamps::now(),
                 },
             );
             let data_path = inner.data_path(ino);
