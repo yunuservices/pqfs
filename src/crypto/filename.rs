@@ -9,8 +9,8 @@ use super::{Crypto, KEY_LEN, NONCE_LEN};
 
 impl Crypto {
     pub fn hash_filename(&self, name: &str) -> [u8; KEY_LEN] {
-        let mut mac =
-            Hmac::<Sha256>::new_from_slice(&self.filename_hash_key).expect("valid HMAC key size");
+        let mut mac = Hmac::<Sha256>::new_from_slice(self.filename_hash_key.as_slice())
+            .expect("valid HMAC key size");
         mac.update(name.as_bytes());
         let bytes = mac.finalize().into_bytes();
         let mut out = [0u8; KEY_LEN];
@@ -51,7 +51,7 @@ mod tests {
 
     fn crypto() -> Crypto {
         let dir = tempfile::tempdir().unwrap();
-        Crypto::init("test-password", dir.path()).unwrap()
+        Crypto::init_for_tests("test-password", dir.path()).unwrap()
     }
 
     #[test]

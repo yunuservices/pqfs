@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::ffi::OsStr;
 use std::sync::{Arc, Mutex, RwLock, mpsc};
 use std::thread::{self, JoinHandle};
@@ -5,11 +6,13 @@ use std::thread::{self, JoinHandle};
 use anyhow::{Context, Result, bail};
 use fuser::{
     Filesystem, MountOption, ReplyAttr, ReplyCreate, ReplyData, ReplyDirectory, ReplyEmpty,
-    ReplyEntry, ReplyOpen, ReplyWrite, Request,
+    ReplyEntry, ReplyOpen, ReplyWrite, Request, TimeOrNow,
 };
-use libc::{EISDIR, ENOENT};
-use tracing::debug;
+use libc::{EIO, EISDIR, ENOENT};
+use std::time::SystemTime;
+use tracing::{debug, error};
 
+use super::blocks;
 use super::entry::EntryKind;
 use super::inner::PqfsInner;
 use crate::cli::Args;
@@ -23,6 +26,7 @@ pub struct Pqfs {
     inner: Arc<RwLock<PqfsInner>>,
     crypto: Arc<Crypto>,
     job_tx: Option<mpsc::Sender<Box<dyn FnOnce() + Send>>>,
+    inode_locks: Arc<Mutex<HashMap<u64, Arc<RwLock<()>>>>>,
     workers: Vec<JoinHandle<()>>,
 }
 
@@ -57,6 +61,7 @@ impl Pqfs {
             inner,
             crypto,
             job_tx: Some(tx),
+            inode_locks: Arc::new(Mutex::new(HashMap::new())),
             workers,
         }
     }
@@ -111,6 +116,11 @@ impl Pqfs {
         self.inner.write().unwrap_or_else(|e| e.into_inner())
     }
 
+    fn inode_lock(&self, ino: u64) -> Arc<RwLock<()>> {
+        let mut locks = self.inode_locks.lock().unwrap_or_else(|e| e.into_inner());
+        Arc::clone(locks.entry(ino).or_default())
+    }
+
     fn spawn_job<F>(&self, job: F)
     where
         F: FnOnce() + Send + 'static,
@@ -123,6 +133,15 @@ impl Pqfs {
 
 impl Drop for Pqfs {
     fn drop(&mut self) {
+        if let Err(e) = self
+            .inner
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+            .flush_index(self.crypto.as_ref())
+        {
+            error!("failed to flush the index on unmount: {}", e);
+        }
+
         // Close the job queue so workers exit after draining pending jobs.
         self.job_tx = None;
         for handle in self.workers.drain(..) {
@@ -154,6 +173,7 @@ impl Filesystem for Pqfs {
         reply: ReplyData,
     ) {
         let crypto = Arc::clone(&self.crypto);
+        let lock = self.inode_lock(ino);
 
         let (entry, data_path) = {
             let inner = self.read_inner();
@@ -165,6 +185,7 @@ impl Filesystem for Pqfs {
         match entry {
             Some(entry) if matches!(entry.kind, EntryKind::File) => {
                 self.spawn_job(move || {
+                    let _guard = lock.read().unwrap_or_else(|e| e.into_inner());
                     PqfsInner::do_read(crypto.as_ref(), &entry, data_path, offset, size, reply);
                 });
             }
@@ -188,17 +209,31 @@ impl Filesystem for Pqfs {
         let data = data.to_vec();
         let inner = Arc::clone(&self.inner);
         let crypto = Arc::clone(&self.crypto);
+        let lock = self.inode_lock(ino);
 
-        let (entry, data_path) = {
+        let (kind, data_path) = {
             let inner = self.read_inner();
-            let entry = inner.entries.get(&ino).cloned();
+            let kind = inner.entries.get(&ino).map(|e| e.kind.clone());
             let data_path = inner.data_path(ino);
-            (entry, data_path)
+            (kind, data_path)
         };
 
-        match entry {
-            Some(entry) if matches!(entry.kind, EntryKind::File) => {
+        match kind {
+            Some(EntryKind::File) => {
                 self.spawn_job(move || {
+                    let _guard = lock.write().unwrap_or_else(|e| e.into_inner());
+
+                    let entry = {
+                        let inner = inner.read().unwrap_or_else(|e| e.into_inner());
+                        match inner.entries.get(&ino) {
+                            Some(entry) => entry.clone(),
+                            None => {
+                                reply.error(ENOENT);
+                                return;
+                            }
+                        }
+                    };
+
                     let (content_key_enc, size) = match PqfsInner::do_write_data(
                         crypto.as_ref(),
                         &entry,
@@ -214,12 +249,117 @@ impl Filesystem for Pqfs {
                     };
                     let written = data.len() as u32;
                     let mut inner = inner.write().unwrap_or_else(|e| e.into_inner());
-                    inner.commit_write(crypto.as_ref(), ino, content_key_enc, size, reply, written);
+                    inner.commit_write(ino, content_key_enc, size, reply, written);
                 });
             }
-            Some(_) => reply.error(EISDIR),
+            Some(EntryKind::Dir) => reply.error(EISDIR),
             None => reply.error(ENOENT),
         }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn setattr(
+        &mut self,
+        _req: &Request<'_>,
+        ino: u64,
+        mode: Option<u32>,
+        uid: Option<u32>,
+        gid: Option<u32>,
+        size: Option<u64>,
+        atime: Option<TimeOrNow>,
+        mtime: Option<TimeOrNow>,
+        _ctime: Option<SystemTime>,
+        _fh: Option<u64>,
+        _crtime: Option<SystemTime>,
+        _chgtime: Option<SystemTime>,
+        _bkuptime: Option<SystemTime>,
+        _flags: Option<u32>,
+        reply: ReplyAttr,
+    ) {
+        let inner = Arc::clone(&self.inner);
+        let crypto = Arc::clone(&self.crypto);
+        let lock = self.inode_lock(ino);
+
+        let (entry, data_path) = {
+            let guard = self.read_inner();
+            (guard.entries.get(&ino).cloned(), guard.data_path(ino))
+        };
+
+        let Some(entry) = entry else {
+            reply.error(ENOENT);
+            return;
+        };
+
+        let Some(size) = size else {
+            self.write_inner().apply_setattr(
+                crypto.as_ref(),
+                ino,
+                mode,
+                uid,
+                gid,
+                atime,
+                mtime,
+                None,
+                reply,
+            );
+            return;
+        };
+
+        if !matches!(entry.kind, EntryKind::File) {
+            reply.error(EISDIR);
+            return;
+        }
+
+        self.spawn_job(move || {
+            let _guard = lock.write().unwrap_or_else(|e| e.into_inner());
+
+            let entry = {
+                let guard = inner.read().unwrap_or_else(|e| e.into_inner());
+                match guard.entries.get(&ino) {
+                    Some(entry) => entry.clone(),
+                    None => {
+                        reply.error(ENOENT);
+                        return;
+                    }
+                }
+            };
+
+            let truncated = match PqfsInner::do_truncate(crypto.as_ref(), &entry, data_path, size) {
+                Ok(v) => v,
+                Err(code) => {
+                    reply.error(code);
+                    return;
+                }
+            };
+
+            let mut guard = inner.write().unwrap_or_else(|e| e.into_inner());
+            guard.apply_setattr(
+                crypto.as_ref(),
+                ino,
+                mode,
+                uid,
+                gid,
+                atime,
+                mtime,
+                Some(truncated),
+                reply,
+            );
+        });
+    }
+
+    fn rename(
+        &mut self,
+        _req: &Request<'_>,
+        parent: u64,
+        name: &OsStr,
+        newparent: u64,
+        newname: &OsStr,
+        _flags: u32,
+        reply: ReplyEmpty,
+    ) {
+        let crypto = Arc::clone(&self.crypto);
+        self.write_inner()
+            .rename(crypto.as_ref(), parent, name, newparent, newname, reply);
     }
 
     fn readdir(
@@ -273,6 +413,75 @@ impl Filesystem for Pqfs {
 
     fn open(&mut self, _req: &Request<'_>, ino: u64, _flags: i32, reply: ReplyOpen) {
         self.read_inner().open(ino, reply);
+    }
+
+    fn fsync(
+        &mut self,
+        _req: &Request<'_>,
+        ino: u64,
+        _fh: u64,
+        _datasync: bool,
+        reply: ReplyEmpty,
+    ) {
+        let crypto = Arc::clone(&self.crypto);
+        let lock = self.inode_lock(ino);
+        let _guard = lock.read().unwrap_or_else(|e| e.into_inner());
+
+        let mut inner = self.write_inner();
+        if let Err(e) = blocks::sync(&inner.data_path(ino)) {
+            error!("fsync error for inode {}: {}", ino, e);
+            reply.error(EIO);
+            return;
+        }
+        if let Err(e) = inner.flush_index(crypto.as_ref()) {
+            error!("index save error: {}", e);
+            reply.error(EIO);
+            return;
+        }
+        reply.ok();
+    }
+
+    fn fsyncdir(
+        &mut self,
+        _req: &Request<'_>,
+        _ino: u64,
+        _fh: u64,
+        _datasync: bool,
+        reply: ReplyEmpty,
+    ) {
+        let crypto = Arc::clone(&self.crypto);
+        if let Err(e) = self.write_inner().flush_index(crypto.as_ref()) {
+            error!("index save error: {}", e);
+            reply.error(EIO);
+            return;
+        }
+        reply.ok();
+    }
+
+    fn flush(
+        &mut self,
+        _req: &Request<'_>,
+        ino: u64,
+        _fh: u64,
+        _lock_owner: u64,
+        reply: ReplyEmpty,
+    ) {
+        let crypto = Arc::clone(&self.crypto);
+        let lock = self.inode_lock(ino);
+        let _guard = lock.read().unwrap_or_else(|e| e.into_inner());
+
+        let mut inner = self.write_inner();
+        if let Err(e) = blocks::sync(&inner.data_path(ino)) {
+            error!("flush error for inode {}: {}", ino, e);
+            reply.error(EIO);
+            return;
+        }
+        if let Err(e) = inner.flush_index(crypto.as_ref()) {
+            error!("index save error: {}", e);
+            reply.error(EIO);
+            return;
+        }
+        reply.ok();
     }
 
     fn release(

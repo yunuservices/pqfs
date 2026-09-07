@@ -7,18 +7,20 @@ mod kem;
 mod keys;
 mod volume;
 
-pub(crate) use header::VolumeHeader;
+pub(crate) use header::{HEADER_VERSION, KdfParams, VolumeHeader};
 pub(crate) use kem::{SELECTED_KEM_PARAM, SelectedKem};
 
 pub(crate) const KEY_LEN: usize = 32;
 pub(crate) const SALT_LEN: usize = 16;
 pub(crate) const NONCE_LEN: usize = 24;
 pub(crate) const SEED_LEN: usize = 64;
+pub(crate) const MAC_LEN: usize = 32;
+pub(crate) const MAX_HEADER_BYTES: u64 = 64 * 1024;
 
 /// Hybrid crypto engine: classical password + ML-KEM selected-parameter-set shared secret.
 pub struct Crypto {
     pub(crate) cipher: XChaCha20Poly1305,
     pub(crate) header: VolumeHeader,
     pub(crate) filename_cipher: XChaCha20Poly1305,
-    pub(crate) filename_hash_key: [u8; KEY_LEN],
+    pub(crate) filename_hash_key: keys::SecretKey,
 }

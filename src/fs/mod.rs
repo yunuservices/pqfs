@@ -1,3 +1,4 @@
+mod blocks;
 mod entry;
 mod inner;
 mod ops;
