@@ -200,7 +200,11 @@ impl PqfsInner {
             (ino, FileType::Directory, ".".to_string()),
             (parent.parent, FileType::Directory, "..".to_string()),
         ];
-        for child in self.entries.values().filter(|e| e.parent == ino) {
+        for child in self
+            .entries
+            .values()
+            .filter(|e| e.parent == ino && e.ino != ino)
+        {
             let name = match crypto.decrypt_filename(&child.name_encrypted) {
                 Ok(n) => n,
                 Err(e) => {
@@ -724,5 +728,22 @@ mod tests {
             assert!(plaintext[0..1024].iter().all(|b| *b == b'A'));
             assert!(plaintext[4096..5120].iter().all(|b| *b == b'B'));
         }
+    }
+
+    #[test]
+    fn root_is_not_listed_as_its_own_child() {
+        let dir = tempfile::tempdir().unwrap();
+        let crypto = Crypto::init_for_tests("pw", dir.path()).unwrap();
+        let inner = PqfsInner::load(dir.path().to_path_buf(), &crypto).unwrap();
+
+        let root = inner.entries.get(&fuser::FUSE_ROOT_ID).unwrap();
+        assert_eq!(root.parent, fuser::FUSE_ROOT_ID);
+
+        let children: Vec<_> = inner
+            .entries
+            .values()
+            .filter(|e| e.parent == fuser::FUSE_ROOT_ID && e.ino != fuser::FUSE_ROOT_ID)
+            .collect();
+        assert!(children.is_empty());
     }
 }
