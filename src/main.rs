@@ -1,4 +1,5 @@
 mod cli;
+mod commands;
 mod crypto;
 mod fs;
 
@@ -14,7 +15,7 @@ fn main() -> Result<()> {
 
     match cli::Cli::parse().command {
         cli::Command::Mount(mut args) => {
-            args.resolve_password()?;
+            args.credential.resolve()?;
             info!(
                 "pqfs starting: backend={}, mountpoint={}",
                 args.backend.display(),
@@ -22,5 +23,9 @@ fn main() -> Result<()> {
             );
             fs::Pqfs::mount(args)
         }
+        cli::Command::Keygen(args) => commands::keygen(args),
+        cli::Command::Slots(args) => commands::slots(args),
+        cli::Command::Share(args) => commands::share(args),
+        cli::Command::Revoke(args) => commands::revoke(args),
     }
 }
