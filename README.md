@@ -33,8 +33,8 @@ makes "harvest now, decrypt later" a losing strategy against a shared volume.
   (ML-KEM-512 / 768 / 1024 selectable at compile time)
 - Share a volume with a recipient's public key and revoke that access later
 - Change the password without re-encrypting the volume
-- Authenticated encryption for file contents, directory index, and file names
-  (XChaCha20Poly1305)
+- Authenticated encryption for file contents, directory index, file names, and
+  symlink targets (XChaCha20Poly1305)
 - Block-based file encryption: reads and writes touch only the blocks they
   need, and each block is bound to its index so blocks cannot be reordered
 - Per-file content keys wrapped by the master key
@@ -235,8 +235,9 @@ After initialization, the encrypted backend (`~/pqfs-backend`) contains:
   another volume without detection.
 - **Block reordering.** Each file block is bound to its index, so blocks cannot
   be swapped within a file.
-- **Accidental metadata leakage.** File names are hashed for lookups and
-  encrypted for storage, so plain file names do not appear on disk.
+- **Accidental metadata leakage.** File names and symlink targets are hashed
+  for lookups and encrypted for storage, so neither appears on disk in the
+  clear.
 
 ### What pqfs does *not* protect against
 
@@ -300,6 +301,7 @@ After initialization, the encrypted backend (`~/pqfs-backend`) contains:
 - [x] File-name encryption
 - [x] Per-file keys instead of one master key
 - [x] Async / multi-threaded FUSE
+- [x] Symbolic links and `statfs`
 - [ ] Benchmark vs. ext4 / LUKS
 - [ ] Switchable AES-256-GCM vs. ChaCha20-Poly1305
 - [x] ML-KEM-1024 / ML-KEM-512 parameter option

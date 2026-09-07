@@ -11,7 +11,7 @@ use fuser::{
     Filesystem, MountOption, ReplyAttr, ReplyCreate, ReplyData, ReplyDirectory, ReplyEmpty,
     ReplyEntry, ReplyOpen, ReplyStatfs, ReplyWrite, Request, TimeOrNow,
 };
-use libc::{EIO, EISDIR, ENOENT};
+use libc::{EINVAL, EIO, EISDIR, ENOENT};
 use std::time::SystemTime;
 use tracing::{debug, error};
 
@@ -258,6 +258,7 @@ impl Filesystem for Pqfs {
                 });
             }
             Some(EntryKind::Dir) => reply.error(EISDIR),
+            Some(EntryKind::Symlink) => reply.error(EINVAL),
             None => reply.error(ENOENT),
         }
     }
@@ -418,6 +419,24 @@ impl Filesystem for Pqfs {
 
     fn open(&mut self, _req: &Request<'_>, ino: u64, _flags: i32, reply: ReplyOpen) {
         self.read_inner().open(ino, reply);
+    }
+
+    fn symlink(
+        &mut self,
+        _req: &Request<'_>,
+        parent: u64,
+        link_name: &OsStr,
+        target: &Path,
+        reply: ReplyEntry,
+    ) {
+        let crypto = Arc::clone(&self.crypto);
+        self.write_inner()
+            .symlink(crypto.as_ref(), parent, link_name, target, reply);
+    }
+
+    fn readlink(&mut self, _req: &Request<'_>, ino: u64, reply: ReplyData) {
+        let crypto = Arc::clone(&self.crypto);
+        self.read_inner().readlink(crypto.as_ref(), ino, reply);
     }
 
     fn statfs(&mut self, _req: &Request<'_>, _ino: u64, reply: ReplyStatfs) {

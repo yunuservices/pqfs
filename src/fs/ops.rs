@@ -1,6 +1,6 @@
 use std::ffi::OsStr;
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use fuser::{
     FUSE_ROOT_ID, FileType, ReplyAttr, ReplyCreate, ReplyData, ReplyDirectory, ReplyEmpty,
@@ -12,7 +12,7 @@ use zeroize::Zeroizing;
 
 use super::TTL;
 use super::blocks;
-use super::entry::{Entry, EntryKind, Timestamps};
+use super::entry::{Entry, EntryKind, Timestamps, file_type};
 use super::inner::PqfsInner;
 use crate::crypto::Crypto;
 
@@ -148,14 +148,7 @@ impl PqfsInner {
                     return;
                 }
             };
-            entries.push((
-                child.ino,
-                match child.kind {
-                    EntryKind::File => FileType::RegularFile,
-                    EntryKind::Dir => FileType::Directory,
-                },
-                name,
-            ));
+            entries.push((child.ino, file_type(&child.kind), name));
         }
 
         for (i, (ino, kind, name)) in entries.into_iter().enumerate().skip(offset as usize) {
@@ -210,6 +203,7 @@ impl PqfsInner {
             uid: unsafe { libc::getuid() },
             gid: unsafe { libc::getgid() },
             times: Timestamps::now(),
+            link_target: Vec::new(),
         };
 
         self.insert_entry(entry.clone());
@@ -258,6 +252,7 @@ impl PqfsInner {
             uid: unsafe { libc::getuid() },
             gid: unsafe { libc::getgid() },
             times: Timestamps::now(),
+            link_target: Vec::new(),
         };
 
         self.insert_entry(entry.clone());
@@ -268,6 +263,84 @@ impl PqfsInner {
         }
 
         reply.entry(&TTL, &self.attr_for(&entry), 0);
+    }
+
+    pub(crate) fn symlink(
+        &mut self,
+        crypto: &Crypto,
+        parent: u64,
+        name: &OsStr,
+        target: &Path,
+        reply: ReplyEntry,
+    ) {
+        if self.find_child(crypto, parent, name).is_some() {
+            reply.error(EEXIST);
+            return;
+        }
+
+        let target = target.to_string_lossy().to_string();
+        let link_target = match crypto.encrypt_filename(&target) {
+            Ok(v) => v,
+            Err(e) => {
+                error!("link target encryption error: {}", e);
+                reply.error(EIO);
+                return;
+            }
+        };
+
+        let ino = self.allocate_ino();
+        let name = name.to_string_lossy().to_string();
+        let name_hash = crypto.hash_filename(&name);
+        let name_encrypted = match crypto.encrypt_filename(&name) {
+            Ok(v) => v,
+            Err(e) => {
+                error!("filename encryption error: {}", e);
+                reply.error(EIO);
+                return;
+            }
+        };
+
+        let entry = Entry {
+            ino,
+            parent,
+            name_hash,
+            name_encrypted,
+            content_key: Vec::new(),
+            kind: EntryKind::Symlink,
+            size: target.len() as u64,
+            perm: 0o777,
+            uid: unsafe { libc::getuid() },
+            gid: unsafe { libc::getgid() },
+            times: Timestamps::now(),
+            link_target,
+        };
+
+        self.insert_entry(entry.clone());
+        if let Err(e) = self.save_index(crypto) {
+            error!("index save error: {}", e);
+            reply.error(EIO);
+            return;
+        }
+
+        reply.entry(&TTL, &self.attr_for(&entry), 0);
+    }
+
+    pub(crate) fn readlink(&self, crypto: &Crypto, ino: u64, reply: ReplyData) {
+        let Some(entry) = self.entries.get(&ino) else {
+            reply.error(ENOENT);
+            return;
+        };
+        if !matches!(entry.kind, EntryKind::Symlink) {
+            reply.error(EINVAL);
+            return;
+        }
+        match crypto.decrypt_filename(&entry.link_target) {
+            Ok(target) => reply.data(target.as_bytes()),
+            Err(e) => {
+                error!("link target decryption error for inode {}: {}", ino, e);
+                reply.error(EIO);
+            }
+        }
     }
 
     pub(crate) fn unlink(&mut self, crypto: &Crypto, parent: u64, name: &OsStr, reply: ReplyEmpty) {
@@ -417,22 +490,25 @@ impl PqfsInner {
         if let Some(existing) = self.find_child(crypto, newparent, newname).cloned()
             && existing.ino != source.ino
         {
-            match (&source.kind, &existing.kind) {
-                (EntryKind::Dir, EntryKind::Dir) => {
+            match (
+                matches!(source.kind, EntryKind::Dir),
+                matches!(existing.kind, EntryKind::Dir),
+            ) {
+                (true, true) => {
                     if self.has_children(existing.ino) {
                         reply.error(ENOTEMPTY);
                         return;
                     }
                 }
-                (EntryKind::Dir, EntryKind::File) => {
+                (true, false) => {
                     reply.error(ENOTDIR);
                     return;
                 }
-                (EntryKind::File, EntryKind::Dir) => {
+                (false, true) => {
                     reply.error(EISDIR);
                     return;
                 }
-                (EntryKind::File, EntryKind::File) => {}
+                (false, false) => {}
             }
 
             self.remove_entry(existing.ino);
@@ -575,6 +651,7 @@ mod tests {
                 uid: 0,
                 gid: 0,
                 times: Timestamps::now(),
+                link_target: Vec::new(),
             });
             let data_path = inner.data_path(ino);
             let inner = Arc::new(RwLock::new(inner));

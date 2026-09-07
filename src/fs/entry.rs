@@ -6,6 +6,7 @@ use serde::{Deserialize, Serialize};
 pub(crate) enum EntryKind {
     File,
     Dir,
+    Symlink,
 }
 
 #[derive(Serialize, Deserialize, Clone, Copy, Debug)]
@@ -62,6 +63,15 @@ pub(crate) struct Entry {
     pub(crate) uid: u32,
     pub(crate) gid: u32,
     pub(crate) times: Timestamps,
+    pub(crate) link_target: Vec<u8>,
+}
+
+pub(crate) fn file_type(kind: &EntryKind) -> fuser::FileType {
+    match kind {
+        EntryKind::File => fuser::FileType::RegularFile,
+        EntryKind::Dir => fuser::FileType::Directory,
+        EntryKind::Symlink => fuser::FileType::Symlink,
+    }
 }
 
 #[cfg(test)]
@@ -82,6 +92,7 @@ mod tests {
             uid: 1000,
             gid: 1000,
             times: Timestamps::now(),
+            link_target: Vec::new(),
         };
         let bytes = bincode::serialize(&entry).unwrap();
         let decoded: Entry = bincode::deserialize(&bytes).unwrap();
