@@ -19,6 +19,7 @@ pub(crate) struct PqfsInner {
     pub(crate) next_ino: u64,
     children: HashMap<(u64, [u8; 32]), u64>,
     by_parent: HashMap<u64, BTreeSet<u64>>,
+    dirty: bool,
 }
 
 impl PqfsInner {
@@ -65,6 +66,7 @@ impl PqfsInner {
             next_ino,
             children: HashMap::new(),
             by_parent: HashMap::new(),
+            dirty: false,
         };
         this.rebuild_indexes();
         Ok(this)
@@ -152,6 +154,17 @@ impl PqfsInner {
         self.by_parent.get(&parent).is_some_and(|s| !s.is_empty())
     }
 
+    pub(crate) fn mark_dirty(&mut self) {
+        self.dirty = true;
+    }
+
+    pub(crate) fn flush_index(&mut self, crypto: &Crypto) -> Result<()> {
+        if !self.dirty {
+            return Ok(());
+        }
+        self.save_index(crypto)
+    }
+
     pub(crate) fn save_index(&mut self, crypto: &Crypto) -> Result<()> {
         let plaintext = bincode::serialize(&self.entries)?;
         let ciphertext = crypto.encrypt(&plaintext)?;
@@ -166,6 +179,7 @@ impl PqfsInner {
 
         fs::rename(&tmp, &index_path)?;
         fs::File::open(&self.backend)?.sync_all()?;
+        self.dirty = false;
         Ok(())
     }
 
@@ -462,5 +476,24 @@ mod tests {
                 .find_child(&crypto, FUSE_ROOT_ID, std::ffi::OsStr::new("x"))
                 .is_none()
         );
+    }
+
+    #[test]
+    fn flush_index_only_writes_when_dirty() {
+        let (dir, crypto) = setup();
+        let mut inner = PqfsInner::load(dir.path().to_path_buf(), &crypto).unwrap();
+        inner.save_index(&crypto).unwrap();
+
+        let path = dir.path().join(INDEX_FILE);
+        let before = std::fs::metadata(&path).unwrap().len();
+        let first = std::fs::read(&path).unwrap();
+
+        inner.flush_index(&crypto).unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), first);
+
+        inner.mark_dirty();
+        inner.flush_index(&crypto).unwrap();
+        assert_ne!(std::fs::read(&path).unwrap(), first);
+        assert_eq!(std::fs::metadata(&path).unwrap().len(), before);
     }
 }

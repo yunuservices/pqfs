@@ -133,6 +133,15 @@ impl Pqfs {
 
 impl Drop for Pqfs {
     fn drop(&mut self) {
+        if let Err(e) = self
+            .inner
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+            .flush_index(self.crypto.as_ref())
+        {
+            error!("failed to flush the index on unmount: {}", e);
+        }
+
         // Close the job queue so workers exit after draining pending jobs.
         self.job_tx = None;
         for handle in self.workers.drain(..) {
@@ -240,7 +249,7 @@ impl Filesystem for Pqfs {
                     };
                     let written = data.len() as u32;
                     let mut inner = inner.write().unwrap_or_else(|e| e.into_inner());
-                    inner.commit_write(crypto.as_ref(), ino, content_key_enc, size, reply, written);
+                    inner.commit_write(ino, content_key_enc, size, reply, written);
                 });
             }
             Some(EntryKind::Dir) => reply.error(EISDIR),
@@ -424,7 +433,7 @@ impl Filesystem for Pqfs {
             reply.error(EIO);
             return;
         }
-        if let Err(e) = inner.save_index(crypto.as_ref()) {
+        if let Err(e) = inner.flush_index(crypto.as_ref()) {
             error!("index save error: {}", e);
             reply.error(EIO);
             return;
@@ -441,7 +450,7 @@ impl Filesystem for Pqfs {
         reply: ReplyEmpty,
     ) {
         let crypto = Arc::clone(&self.crypto);
-        if let Err(e) = self.write_inner().save_index(crypto.as_ref()) {
+        if let Err(e) = self.write_inner().flush_index(crypto.as_ref()) {
             error!("index save error: {}", e);
             reply.error(EIO);
             return;
@@ -467,7 +476,7 @@ impl Filesystem for Pqfs {
             reply.error(EIO);
             return;
         }
-        if let Err(e) = inner.save_index(crypto.as_ref()) {
+        if let Err(e) = inner.flush_index(crypto.as_ref()) {
             error!("index save error: {}", e);
             reply.error(EIO);
             return;

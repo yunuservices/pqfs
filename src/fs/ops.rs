@@ -480,17 +480,17 @@ impl PqfsInner {
     /// Update the metadata after a write has completed on disk.
     pub(crate) fn commit_write(
         &mut self,
-        crypto: &Crypto,
         ino: u64,
         content_key_enc: Vec<u8>,
         size: u64,
         reply: ReplyWrite,
         written: u32,
     ) {
-        if let Some(e) = self.entries.get_mut(&ino) {
+        let updated = if let Some(e) = self.entries.get_mut(&ino) {
             e.content_key = content_key_enc;
             e.size = size;
             e.times.touch_modified();
+            true
         } else {
             // Entry was removed while the write was in flight. The data file
             // is already on disk; report success because the write completed.
@@ -498,11 +498,11 @@ impl PqfsInner {
                 "inode {} removed during write; orphan data file may remain",
                 ino
             );
-        }
-        if let Err(e) = self.save_index(crypto) {
-            error!("index save error: {}", e);
-            reply.error(EIO);
-            return;
+            false
+        };
+
+        if updated {
+            self.mark_dirty();
         }
         reply.written(written);
     }
