@@ -63,7 +63,7 @@ mod tests {
 
     fn crypto() -> Crypto {
         let dir = tempfile::tempdir().unwrap();
-        Crypto::init("test-password", dir.path()).unwrap()
+        Crypto::init_for_tests("test-password", dir.path()).unwrap()
     }
 
     #[test]

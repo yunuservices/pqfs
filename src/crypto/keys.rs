@@ -1,12 +1,13 @@
 use anyhow::{Result, bail};
-use argon2::Argon2;
+use argon2::{Algorithm, Argon2, Params, Version as ArgonVersion};
 use chacha20poly1305::aead::KeyInit;
 use chacha20poly1305::{Key, XChaCha20Poly1305, XNonce};
 use hkdf::Hkdf;
+use hmac::{Hmac, Mac};
 use rand::Rng;
 use sha2::Sha256;
 
-use super::{Crypto, KEY_LEN, NONCE_LEN, SALT_LEN, VolumeHeader};
+use super::{Crypto, KEY_LEN, KdfParams, MAC_LEN, NONCE_LEN, SALT_LEN, VolumeHeader};
 
 pub(crate) fn random_nonce() -> XNonce {
     let mut nonce = [0u8; NONCE_LEN];
@@ -19,11 +20,17 @@ pub(crate) fn build_cipher(key: &[u8]) -> Result<XChaCha20Poly1305> {
     Ok(XChaCha20Poly1305::new(&k))
 }
 
-pub(crate) fn derive_password_key(password: &str, salt: &[u8]) -> Result<[u8; KEY_LEN]> {
+pub(crate) fn derive_password_key(
+    password: &str,
+    salt: &[u8],
+    kdf: KdfParams,
+) -> Result<[u8; KEY_LEN]> {
     if salt.len() != SALT_LEN {
         bail!("invalid salt length");
     }
-    let argon2 = Argon2::default();
+    let params = Params::new(kdf.m_cost, kdf.t_cost, kdf.p_cost, Some(KEY_LEN))
+        .map_err(|e| anyhow::anyhow!("invalid Argon2 parameters: {}", e))?;
+    let argon2 = Argon2::new(Algorithm::Argon2id, ArgonVersion::V0x13, params);
     let mut out = [0u8; KEY_LEN];
     argon2
         .hash_password_into(password.as_bytes(), salt, &mut out)
@@ -43,6 +50,32 @@ pub(crate) fn derive_master_key(
     hkdf.expand(b"pqfs-hybrid-master-key", &mut okm)
         .map_err(|e| anyhow::anyhow!("HKDF expand failed: {}", e))?;
     Ok(okm)
+}
+
+pub(crate) fn derive_header_mac_key(password_key: &[u8]) -> Result<[u8; KEY_LEN]> {
+    let hkdf = Hkdf::<Sha256>::new(None, password_key);
+    let mut okm = [0u8; KEY_LEN];
+    hkdf.expand(b"pqfs-header-mac-key", &mut okm)
+        .map_err(|e| anyhow::anyhow!("HKDF header mac key expand failed: {}", e))?;
+    Ok(okm)
+}
+
+pub(crate) fn header_mac(mac_key: &[u8], header: &VolumeHeader) -> Result<[u8; MAC_LEN]> {
+    let mut mac = Hmac::<Sha256>::new_from_slice(mac_key)
+        .map_err(|e| anyhow::anyhow!("invalid header mac key: {}", e))?;
+    mac.update(&header.authenticated_bytes()?);
+    let bytes = mac.finalize().into_bytes();
+    let mut out = [0u8; MAC_LEN];
+    out.copy_from_slice(&bytes);
+    Ok(out)
+}
+
+pub(crate) fn verify_header_mac(mac_key: &[u8], header: &VolumeHeader) -> Result<()> {
+    let mut mac = Hmac::<Sha256>::new_from_slice(mac_key)
+        .map_err(|e| anyhow::anyhow!("invalid header mac key: {}", e))?;
+    mac.update(&header.authenticated_bytes()?);
+    mac.verify_slice(&header.mac)
+        .map_err(|_| anyhow::anyhow!("password incorrect or volume header has been modified"))
 }
 
 pub(crate) fn derive_filename_keys(master_key: &[u8]) -> Result<([u8; KEY_LEN], [u8; KEY_LEN])> {
@@ -80,6 +113,12 @@ impl Crypto {
 mod tests {
     use super::*;
 
+    const TEST_KDF: KdfParams = KdfParams {
+        m_cost: 8,
+        t_cost: 1,
+        p_cost: 1,
+    };
+
     #[test]
     fn random_nonce_has_correct_length() {
         assert_eq!(random_nonce().len(), NONCE_LEN);
@@ -88,21 +127,21 @@ mod tests {
     #[test]
     fn derive_password_key_produces_32_bytes() {
         let salt = [0u8; SALT_LEN];
-        let key = derive_password_key("password", &salt).unwrap();
+        let key = derive_password_key("password", &salt, TEST_KDF).unwrap();
         assert_eq!(key.len(), KEY_LEN);
     }
 
     #[test]
     fn derive_password_key_is_deterministic() {
         let salt = [1u8; SALT_LEN];
-        let a = derive_password_key("same", &salt).unwrap();
-        let b = derive_password_key("same", &salt).unwrap();
+        let a = derive_password_key("same", &salt, TEST_KDF).unwrap();
+        let b = derive_password_key("same", &salt, TEST_KDF).unwrap();
         assert_eq!(a, b);
     }
 
     #[test]
     fn derive_master_key_is_32_bytes_and_sensitive_to_input() {
-        let pw = derive_password_key("pw", &[0u8; SALT_LEN]).unwrap();
+        let pw = derive_password_key("pw", &[0u8; SALT_LEN], TEST_KDF).unwrap();
         let ss = [0u8; 64];
         let key_a = derive_master_key(&pw, &ss).unwrap();
         assert_eq!(key_a.len(), KEY_LEN);

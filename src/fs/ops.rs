@@ -457,7 +457,7 @@ mod tests {
     fn concurrent_writes_to_one_inode_do_not_lose_data() {
         for _ in 0..8 {
             let dir = tempfile::tempdir().unwrap();
-            let crypto = Arc::new(Crypto::init("pw", dir.path()).unwrap());
+            let crypto = Arc::new(Crypto::init_for_tests("pw", dir.path()).unwrap());
             let mut inner = PqfsInner::load(dir.path().to_path_buf(), &crypto).unwrap();
             let ino = inner.allocate_ino();
             inner.entries.insert(
