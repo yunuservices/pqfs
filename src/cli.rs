@@ -33,6 +33,18 @@ pub enum Command {
 
     /// Remove a key slot from a volume.
     Revoke(RevokeArgs),
+
+    /// Replace the password slot of a volume.
+    Passwd(PasswdArgs),
+}
+
+#[derive(Parser, Debug)]
+pub struct PasswdArgs {
+    /// Directory holding the encrypted volume.
+    pub backend: PathBuf,
+
+    #[command(flatten)]
+    pub credential: CredentialArgs,
 }
 
 #[derive(Parser, Debug)]

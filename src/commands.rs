@@ -2,8 +2,8 @@ use std::path::Path;
 
 use anyhow::{Result, bail};
 
-use crate::cli::{KeygenArgs, RevokeArgs, ShareArgs, VolumeArgs};
-use crate::crypto::{Identity, PublicIdentity, volume};
+use crate::cli::{KeygenArgs, PasswdArgs, RevokeArgs, ShareArgs, VolumeArgs, prompt_password};
+use crate::crypto::{Identity, KeySlot, PublicIdentity, volume};
 
 pub fn keygen(args: KeygenArgs) -> Result<()> {
     if args.out.exists() {
@@ -80,6 +80,45 @@ pub fn revoke(mut args: RevokeArgs) -> Result<()> {
     volume::write_header(&args.backend, &mut header, master_key.as_slice())?;
 
     println!("removed {} slot {}", removed.kind(), args.slot);
+    Ok(())
+}
+
+pub fn passwd(mut args: PasswdArgs) -> Result<()> {
+    args.credential.resolve()?;
+    let identity = args.credential.identity_file()?;
+    let mut header = volume::read_header(&args.backend)?;
+    let master_key = volume::open_master_key(&header, &args.credential.unlock(&identity)?)?;
+
+    let new_password = prompt_password("New volume password: ")?;
+    if new_password != prompt_password("Repeat new password: ")? {
+        bail!("the passwords do not match");
+    }
+    if new_password.is_empty() {
+        bail!("the password must not be empty");
+    }
+
+    let kdf = header
+        .slots
+        .iter()
+        .find_map(|slot| match slot {
+            KeySlot::Password { kdf, .. } => Some(*kdf),
+            _ => None,
+        })
+        .unwrap_or_default();
+
+    let slot = volume::password_slot(&new_password, &header.volume_id, master_key.as_slice(), kdf)?;
+
+    match header
+        .slots
+        .iter()
+        .position(|slot| matches!(slot, KeySlot::Password { .. }))
+    {
+        Some(index) => header.slots[index] = slot,
+        None => header.slots.push(slot),
+    }
+    volume::write_header(&args.backend, &mut header, master_key.as_slice())?;
+
+    println!("password slot rewrapped");
     Ok(())
 }
 
