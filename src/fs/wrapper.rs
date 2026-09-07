@@ -1,21 +1,25 @@
 use std::collections::HashMap;
+use std::ffi::CString;
 use std::ffi::OsStr;
+use std::os::unix::ffi::OsStrExt;
+use std::path::Path;
 use std::sync::{Arc, Mutex, RwLock, mpsc};
 use std::thread::{self, JoinHandle};
 
 use anyhow::{Context, Result, bail};
 use fuser::{
     Filesystem, MountOption, ReplyAttr, ReplyCreate, ReplyData, ReplyDirectory, ReplyEmpty,
-    ReplyEntry, ReplyOpen, ReplyWrite, Request, TimeOrNow,
+    ReplyEntry, ReplyOpen, ReplyStatfs, ReplyWrite, Request, TimeOrNow,
 };
-use libc::{EIO, EISDIR, ENOENT};
+use libc::{EINVAL, EIO, EISDIR, ENOENT};
 use std::time::SystemTime;
 use tracing::{debug, error};
 
+use super::MAX_NAME_LEN;
 use super::blocks;
 use super::entry::EntryKind;
 use super::inner::PqfsInner;
-use crate::cli::Args;
+use crate::cli::MountArgs;
 use crate::crypto::Crypto;
 
 /// Thread-pool wrapper around `PqfsInner`. `Crypto` is shared via an `Arc`, and
@@ -66,12 +70,13 @@ impl Pqfs {
         }
     }
 
-    pub fn mount(args: Args) -> Result<()> {
+    pub fn mount(args: MountArgs) -> Result<()> {
         let header_exists = args.backend.join("pqfs.header").exists();
+        let identity = args.credential.identity_file()?;
         let crypto = if header_exists {
-            Crypto::load(args.password.as_deref().unwrap(), &args.backend)?
+            Crypto::unlock(&args.backend, args.credential.unlock(&identity)?)?
         } else if args.init {
-            Crypto::init(args.password.as_deref().unwrap(), &args.backend)?
+            Crypto::init(args.credential.require_password()?, &args.backend)?
         } else {
             bail!(
                 "no volume found at {}; use --init to create one",
@@ -253,6 +258,7 @@ impl Filesystem for Pqfs {
                 });
             }
             Some(EntryKind::Dir) => reply.error(EISDIR),
+            Some(EntryKind::Symlink) => reply.error(EINVAL),
             None => reply.error(ENOENT),
         }
     }
@@ -415,6 +421,46 @@ impl Filesystem for Pqfs {
         self.read_inner().open(ino, reply);
     }
 
+    fn symlink(
+        &mut self,
+        _req: &Request<'_>,
+        parent: u64,
+        link_name: &OsStr,
+        target: &Path,
+        reply: ReplyEntry,
+    ) {
+        let crypto = Arc::clone(&self.crypto);
+        self.write_inner()
+            .symlink(crypto.as_ref(), parent, link_name, target, reply);
+    }
+
+    fn readlink(&mut self, _req: &Request<'_>, ino: u64, reply: ReplyData) {
+        let crypto = Arc::clone(&self.crypto);
+        self.read_inner().readlink(crypto.as_ref(), ino, reply);
+    }
+
+    fn statfs(&mut self, _req: &Request<'_>, _ino: u64, reply: ReplyStatfs) {
+        let inner = self.read_inner();
+        let stats = match backing_store_stats(&inner.backend) {
+            Ok(stats) => stats,
+            Err(e) => {
+                error!("statfs error: {}", e);
+                reply.error(EIO);
+                return;
+            }
+        };
+        reply.statfs(
+            stats.blocks,
+            stats.blocks_free,
+            stats.blocks_available,
+            inner.entries.len() as u64 + stats.files_free,
+            stats.files_free,
+            stats.block_size,
+            u32::from(MAX_NAME_LEN),
+            stats.fragment_size,
+        );
+    }
+
     fn fsync(
         &mut self,
         _req: &Request<'_>,
@@ -496,4 +542,33 @@ impl Filesystem for Pqfs {
     ) {
         PqfsInner::release(reply);
     }
+}
+
+struct BackingStoreStats {
+    blocks: u64,
+    blocks_free: u64,
+    blocks_available: u64,
+    files_free: u64,
+    block_size: u32,
+    fragment_size: u32,
+}
+
+fn backing_store_stats(backend: &Path) -> std::io::Result<BackingStoreStats> {
+    let path = CString::new(backend.as_os_str().as_bytes())
+        .map_err(|_| std::io::Error::other("backend path contains a nul byte"))?;
+
+    let mut raw = std::mem::MaybeUninit::<libc::statvfs>::uninit();
+    if unsafe { libc::statvfs(path.as_ptr(), raw.as_mut_ptr()) } != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    let raw = unsafe { raw.assume_init() };
+
+    Ok(BackingStoreStats {
+        blocks: raw.f_blocks,
+        blocks_free: raw.f_bfree,
+        blocks_available: raw.f_bavail,
+        files_free: raw.f_ffree,
+        block_size: raw.f_bsize as u32,
+        fragment_size: raw.f_frsize as u32,
+    })
 }

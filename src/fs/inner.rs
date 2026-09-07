@@ -2,12 +2,12 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::ffi::OsStr;
 use std::fs;
 use std::io::Write;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
-use fuser::{FUSE_ROOT_ID, FileAttr, FileType};
+use fuser::{FUSE_ROOT_ID, FileAttr};
 
-use super::entry::{Entry, EntryKind, Timestamps, to_system_time};
+use super::entry::{Entry, EntryKind, Timestamps, file_type, to_system_time};
 use super::{BLOCK_SIZE, INDEX_FILE};
 use crate::crypto::Crypto;
 
@@ -31,7 +31,9 @@ impl PqfsInner {
         let (entries, next_ino) = if index_path.exists() {
             let data = fs::read(&index_path)
                 .with_context(|| format!("failed to read {}", index_path.display()))?;
-            let plaintext = crypto.decrypt(&data).context("failed to decrypt index")?;
+            let plaintext = crypto.decrypt(&data).context(
+                "failed to decrypt index (the volume may have been rekeyed since this header was written)",
+            )?;
             let map: BTreeMap<u64, Entry> = bincode::deserialize(&plaintext)?;
             let next_ino = map.keys().next_back().copied().unwrap_or(FUSE_ROOT_ID) + 1;
             (map, next_ino)
@@ -55,6 +57,7 @@ impl PqfsInner {
                     uid: unsafe { libc::getuid() },
                     gid: unsafe { libc::getgid() },
                     times: Timestamps::now(),
+                    link_target: Vec::new(),
                 },
             );
             (map, FUSE_ROOT_ID + 1)
@@ -192,10 +195,7 @@ impl PqfsInner {
             mtime: to_system_time(entry.times.mtime),
             ctime: to_system_time(entry.times.ctime),
             crtime: to_system_time(entry.times.crtime),
-            kind: match entry.kind {
-                EntryKind::File => FileType::RegularFile,
-                EntryKind::Dir => FileType::Directory,
-            },
+            kind: file_type(&entry.kind),
             perm: entry.perm,
             nlink: 1,
             uid: entry.uid,
@@ -226,6 +226,47 @@ impl PqfsInner {
         self.next_ino += 1;
         ino
     }
+}
+
+/// Re-encrypt the directory index under a new master key. File contents are
+/// left untouched: only the wrapped per-file keys and the encrypted names are
+/// rewritten, so the cost is proportional to the number of entries.
+pub(crate) fn rekey_index(backend: &Path, old: &Crypto, new: &Crypto) -> Result<Vec<u8>> {
+    let index_path = backend.join(INDEX_FILE);
+    let mut entries: BTreeMap<u64, Entry> = if index_path.exists() {
+        let data = fs::read(&index_path)
+            .with_context(|| format!("failed to read {}", index_path.display()))?;
+        let plaintext = old.decrypt(&data).context("failed to decrypt index")?;
+        bincode::deserialize(&plaintext)?
+    } else {
+        BTreeMap::new()
+    };
+
+    for entry in entries.values_mut() {
+        if !entry.content_key.is_empty() {
+            let content_key = old
+                .decrypt(&entry.content_key)
+                .with_context(|| format!("failed to unwrap the key of inode {}", entry.ino))?;
+            entry.content_key = new.encrypt(&content_key)?;
+        }
+
+        if !entry.name_encrypted.is_empty() {
+            let name = old
+                .decrypt_filename(&entry.name_encrypted)
+                .with_context(|| format!("failed to decrypt the name of inode {}", entry.ino))?;
+            entry.name_encrypted = new.encrypt_filename(&name)?;
+            entry.name_hash = new.hash_filename(&name);
+        }
+
+        if !entry.link_target.is_empty() {
+            let target = old.decrypt_filename(&entry.link_target).with_context(|| {
+                format!("failed to decrypt the link target of inode {}", entry.ino)
+            })?;
+            entry.link_target = new.encrypt_filename(&target)?;
+        }
+    }
+
+    new.encrypt(&bincode::serialize(&entries)?)
 }
 
 #[cfg(test)]
@@ -284,6 +325,7 @@ mod tests {
             uid: 0,
             gid: 0,
             times: Timestamps::now(),
+            link_target: Vec::new(),
         });
 
         inner.save_index(&crypto).unwrap();
@@ -312,6 +354,7 @@ mod tests {
             perm: 0o644,
             uid: 0,
             gid: 0,
+            link_target: Vec::new(),
             times,
         });
 
@@ -354,6 +397,7 @@ mod tests {
                 uid: 0,
                 gid: 0,
                 times: Timestamps::now(),
+                link_target: Vec::new(),
             });
         }
 
@@ -381,6 +425,7 @@ mod tests {
             uid: 0,
             gid: 0,
             times: Timestamps::now(),
+            link_target: Vec::new(),
         });
         inner.save_index(&crypto).unwrap();
 
@@ -412,6 +457,7 @@ mod tests {
             uid: 0,
             gid: 0,
             times: Timestamps::now(),
+            link_target: Vec::new(),
         });
 
         let ino = inner.allocate_ino();
@@ -427,6 +473,7 @@ mod tests {
             uid: 0,
             gid: 0,
             times: Timestamps::now(),
+            link_target: Vec::new(),
         });
 
         inner.relink(
@@ -466,6 +513,7 @@ mod tests {
             uid: 0,
             gid: 0,
             times: Timestamps::now(),
+            link_target: Vec::new(),
         });
         assert!(inner.has_children(FUSE_ROOT_ID));
 
@@ -495,5 +543,70 @@ mod tests {
         inner.flush_index(&crypto).unwrap();
         assert_ne!(std::fs::read(&path).unwrap(), first);
         assert_eq!(std::fs::metadata(&path).unwrap().len(), before);
+    }
+
+    #[test]
+    fn rekey_rewraps_keys_names_and_link_targets() {
+        let dir = tempfile::tempdir().unwrap();
+        let old = Crypto::init_for_tests("pw", dir.path()).unwrap();
+        let mut inner = PqfsInner::load(dir.path().to_path_buf(), &old).unwrap();
+
+        let file = inner.allocate_ino();
+        inner.insert_entry(Entry {
+            ino: file,
+            parent: FUSE_ROOT_ID,
+            name_hash: old.hash_filename("belge.txt"),
+            name_encrypted: old.encrypt_filename("belge.txt").unwrap(),
+            content_key: old.encrypt(old.random_key().as_slice()).unwrap(),
+            kind: EntryKind::File,
+            size: 0,
+            perm: 0o644,
+            uid: 0,
+            gid: 0,
+            times: Timestamps::now(),
+            link_target: Vec::new(),
+        });
+
+        let link = inner.allocate_ino();
+        inner.insert_entry(Entry {
+            ino: link,
+            parent: FUSE_ROOT_ID,
+            name_hash: old.hash_filename("link"),
+            name_encrypted: old.encrypt_filename("link").unwrap(),
+            content_key: Vec::new(),
+            kind: EntryKind::Symlink,
+            size: 9,
+            perm: 0o777,
+            uid: 0,
+            gid: 0,
+            times: Timestamps::now(),
+            link_target: old.encrypt_filename("belge.txt").unwrap(),
+        });
+        let old_content_key = inner.entries.get(&file).unwrap().content_key.clone();
+        inner.save_index(&old).unwrap();
+
+        let new = Crypto::init_for_tests("pw2", &dir.path().join("other")).unwrap();
+        let index = rekey_index(dir.path(), &old, &new).unwrap();
+        std::fs::write(dir.path().join(INDEX_FILE), index).unwrap();
+
+        let reloaded = PqfsInner::load(dir.path().to_path_buf(), &new).unwrap();
+        let file_entry = reloaded.entries.get(&file).unwrap();
+        assert_ne!(file_entry.content_key, old_content_key);
+        assert_eq!(
+            new.decrypt(&file_entry.content_key).unwrap(),
+            old.decrypt(&old_content_key).unwrap()
+        );
+        assert!(
+            reloaded
+                .find_child(&new, FUSE_ROOT_ID, std::ffi::OsStr::new("belge.txt"))
+                .is_some()
+        );
+
+        let link_entry = reloaded.entries.get(&link).unwrap();
+        assert_eq!(
+            new.decrypt_filename(&link_entry.link_target).unwrap(),
+            "belge.txt"
+        );
+        assert!(old.decrypt_filename(&link_entry.link_target).is_err());
     }
 }

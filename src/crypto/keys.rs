@@ -1,6 +1,6 @@
 use anyhow::{Result, bail};
 use argon2::{Algorithm, Argon2, Params, Version as ArgonVersion};
-use chacha20poly1305::aead::KeyInit;
+use chacha20poly1305::aead::{Aead, KeyInit, Payload};
 use chacha20poly1305::{Key, XChaCha20Poly1305, XNonce};
 use hkdf::Hkdf;
 use hmac::{Hmac, Mac};
@@ -42,23 +42,62 @@ pub(crate) fn derive_password_key(
     Ok(out)
 }
 
-pub(crate) fn derive_master_key(password_key: &[u8], shared_secret: &[u8]) -> Result<SecretKey> {
-    let mut ikm = Vec::with_capacity(password_key.len() + shared_secret.len());
-    ikm.extend_from_slice(password_key);
-    ikm.extend_from_slice(shared_secret);
-    let hkdf = Hkdf::<Sha256>::new(None, &ikm);
-    let mut okm = Zeroizing::new([0u8; KEY_LEN]);
-    hkdf.expand(b"pqfs-hybrid-master-key", okm.as_mut_slice())
-        .map_err(|e| anyhow::anyhow!("HKDF expand failed: {}", e))?;
-    Ok(okm)
-}
-
-pub(crate) fn derive_header_mac_key(password_key: &[u8]) -> Result<SecretKey> {
-    let hkdf = Hkdf::<Sha256>::new(None, password_key);
+pub(crate) fn derive_header_mac_key(master_key: &[u8]) -> Result<SecretKey> {
+    let hkdf = Hkdf::<Sha256>::new(None, master_key);
     let mut okm = Zeroizing::new([0u8; KEY_LEN]);
     hkdf.expand(b"pqfs-header-mac-key", okm.as_mut_slice())
         .map_err(|e| anyhow::anyhow!("HKDF header mac key expand failed: {}", e))?;
     Ok(okm)
+}
+
+pub(crate) fn derive_recipient_kek(shared_secret: &[u8]) -> Result<SecretKey> {
+    let hkdf = Hkdf::<Sha256>::new(None, shared_secret);
+    let mut okm = Zeroizing::new([0u8; KEY_LEN]);
+    hkdf.expand(b"pqfs-recipient-kek", okm.as_mut_slice())
+        .map_err(|e| anyhow::anyhow!("HKDF recipient kek expand failed: {}", e))?;
+    Ok(okm)
+}
+
+pub(crate) fn wrap_master_key(kek: &[u8], volume_id: &[u8], master_key: &[u8]) -> Result<Vec<u8>> {
+    let cipher = build_cipher(kek)?;
+    let nonce = random_nonce();
+    let ciphertext = cipher
+        .encrypt(
+            &nonce,
+            Payload {
+                msg: master_key,
+                aad: volume_id,
+            },
+        )
+        .map_err(|_| anyhow::anyhow!("failed to wrap the master key"))?;
+    let mut out = Vec::with_capacity(NONCE_LEN + ciphertext.len());
+    out.extend_from_slice(nonce.as_ref());
+    out.extend_from_slice(&ciphertext);
+    Ok(out)
+}
+
+pub(crate) fn unwrap_master_key(kek: &[u8], volume_id: &[u8], blob: &[u8]) -> Result<SecretKey> {
+    if blob.len() < NONCE_LEN + 16 {
+        bail!("wrapped master key is too short");
+    }
+    let (nonce, ct) = blob.split_at(NONCE_LEN);
+    let nonce = XNonce::try_from(nonce).map_err(|_| anyhow::anyhow!("invalid wrap nonce"))?;
+    let cipher = build_cipher(kek)?;
+    let plaintext = cipher
+        .decrypt(
+            &nonce,
+            Payload {
+                msg: ct,
+                aad: volume_id,
+            },
+        )
+        .map_err(|_| anyhow::anyhow!("this key does not open the volume"))?;
+    let mut out = Zeroizing::new([0u8; KEY_LEN]);
+    if plaintext.len() != KEY_LEN {
+        bail!("unwrapped master key has the wrong length");
+    }
+    out.copy_from_slice(&plaintext);
+    Ok(out)
 }
 
 pub(crate) fn header_mac(mac_key: &[u8], header: &VolumeHeader) -> Result<[u8; MAC_LEN]> {
@@ -138,19 +177,6 @@ mod tests {
         let a = derive_password_key("same", &salt, TEST_KDF).unwrap();
         let b = derive_password_key("same", &salt, TEST_KDF).unwrap();
         assert_eq!(a, b);
-    }
-
-    #[test]
-    fn derive_master_key_is_32_bytes_and_sensitive_to_input() {
-        let pw = derive_password_key("pw", &[0u8; SALT_LEN], TEST_KDF).unwrap();
-        let ss = [0u8; 64];
-        let key_a = derive_master_key(pw.as_slice(), &ss).unwrap();
-        assert_eq!(key_a.len(), KEY_LEN);
-
-        let mut ss2 = ss;
-        ss2[0] ^= 1;
-        let key_b = derive_master_key(pw.as_slice(), &ss2).unwrap();
-        assert_ne!(key_a, key_b);
     }
 
     #[test]

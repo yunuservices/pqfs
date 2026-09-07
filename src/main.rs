@@ -1,4 +1,5 @@
 mod cli;
+mod commands;
 mod crypto;
 mod fs;
 
@@ -12,14 +13,21 @@ fn main() -> Result<()> {
         .with_env_filter(EnvFilter::from_default_env())
         .init();
 
-    let mut args = cli::Args::parse();
-    args.resolve_password()?;
-
-    info!(
-        "pqfs starting: backend={}, mountpoint={}",
-        args.backend.display(),
-        args.mountpoint.display()
-    );
-
-    fs::Pqfs::mount(args)
+    match cli::Cli::parse().command {
+        cli::Command::Mount(mut args) => {
+            args.credential.resolve()?;
+            info!(
+                "pqfs starting: backend={}, mountpoint={}",
+                args.backend.display(),
+                args.mountpoint.display()
+            );
+            fs::Pqfs::mount(args)
+        }
+        cli::Command::Keygen(args) => commands::keygen(args),
+        cli::Command::Slots(args) => commands::slots(args),
+        cli::Command::Share(args) => commands::share(args),
+        cli::Command::Revoke(args) => commands::revoke(args),
+        cli::Command::Passwd(args) => commands::passwd(args),
+        cli::Command::Rekey(args) => commands::rekey(args),
+    }
 }
