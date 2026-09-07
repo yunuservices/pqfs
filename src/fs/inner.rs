@@ -1,6 +1,7 @@
 use std::collections::BTreeMap;
 use std::ffi::OsStr;
 use std::fs;
+use std::io::Write;
 use std::path::PathBuf;
 use std::time::SystemTime;
 
@@ -68,8 +69,15 @@ impl PqfsInner {
         let ciphertext = crypto.encrypt(&plaintext)?;
         let index_path = self.backend.join(INDEX_FILE);
         let tmp = index_path.with_extension("tmp");
-        fs::write(&tmp, ciphertext)?;
+
+        let mut file = fs::File::create(&tmp)
+            .with_context(|| format!("failed to create {}", tmp.display()))?;
+        file.write_all(&ciphertext)?;
+        file.sync_all()?;
+        drop(file);
+
         fs::rename(&tmp, &index_path)?;
+        fs::File::open(&self.backend)?.sync_all()?;
         Ok(())
     }
 
@@ -148,6 +156,16 @@ mod tests {
         let mut inner = PqfsInner::load(dir.path().to_path_buf(), &crypto).unwrap();
         inner.save_index(&crypto).unwrap();
         assert!(dir.path().join(INDEX_FILE).exists());
+    }
+
+    #[test]
+    fn save_index_leaves_no_temporary_file() {
+        let (dir, crypto) = setup();
+        let mut inner = PqfsInner::load(dir.path().to_path_buf(), &crypto).unwrap();
+        inner.save_index(&crypto).unwrap();
+        inner.save_index(&crypto).unwrap();
+        assert!(dir.path().join(INDEX_FILE).exists());
+        assert!(!dir.path().join("pqfs.tmp").exists());
     }
 
     #[test]
