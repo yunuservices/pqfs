@@ -15,7 +15,7 @@ use tracing::{debug, error};
 use super::blocks;
 use super::entry::EntryKind;
 use super::inner::PqfsInner;
-use crate::cli::Args;
+use crate::cli::MountArgs;
 use crate::crypto::Crypto;
 
 /// Thread-pool wrapper around `PqfsInner`. `Crypto` is shared via an `Arc`, and
@@ -66,7 +66,7 @@ impl Pqfs {
         }
     }
 
-    pub fn mount(args: Args) -> Result<()> {
+    pub fn mount(args: MountArgs) -> Result<()> {
         let header_exists = args.backend.join("pqfs.header").exists();
         let crypto = if header_exists {
             Crypto::load(args.password.as_deref().unwrap(), &args.backend)?

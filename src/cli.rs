@@ -2,7 +2,7 @@ use std::io::IsTerminal;
 use std::path::PathBuf;
 
 use anyhow::{Context, Result};
-use clap::Parser;
+use clap::{Parser, Subcommand};
 
 #[derive(Parser, Debug)]
 #[command(
@@ -10,14 +10,26 @@ use clap::Parser;
     about = "pqfs / hybrid post-quantum FUSE filesystem",
     version
 )]
-pub struct Args {
+pub struct Cli {
+    #[command(subcommand)]
+    pub command: Command,
+}
+
+#[derive(Subcommand, Debug)]
+pub enum Command {
+    /// Mount a volume.
+    Mount(MountArgs),
+}
+
+#[derive(Parser, Debug)]
+pub struct MountArgs {
     /// Directory used to store encrypted files and metadata.
     pub backend: PathBuf,
 
     /// Directory where the filesystem will be mounted.
     pub mountpoint: PathBuf,
 
-    /// Password used to derive the master key.
+    /// Password used to unlock the volume.
     ///
     /// Falls back to the `PQFS_PASSWORD` environment variable. If neither is
     /// supplied and stdin is a TTY, you will be prompted securely.
@@ -36,22 +48,22 @@ pub struct Args {
     pub options: Vec<String>,
 }
 
-impl Args {
+impl MountArgs {
     /// Resolve the password from CLI arg, env var, or interactive prompt.
     pub fn resolve_password(&mut self) -> Result<()> {
         if self.password.as_ref().is_some_and(|pw| !pw.is_empty()) {
             return Ok(());
         }
-
-        if std::io::stdin().is_terminal() {
-            let pw = rpassword::prompt_password("Volume password: ")
-                .context("failed to read password")?;
-            self.password = Some(pw);
-            Ok(())
-        } else {
-            Err(anyhow::anyhow!(
-                "password is required (use --password, set PQFS_PASSWORD, or run interactively)"
-            ))
-        }
+        self.password = Some(prompt_password("Volume password: ")?);
+        Ok(())
     }
+}
+
+pub fn prompt_password(prompt: &str) -> Result<String> {
+    if !std::io::stdin().is_terminal() {
+        anyhow::bail!(
+            "password is required (use --password, set PQFS_PASSWORD, or run interactively)"
+        );
+    }
+    rpassword::prompt_password(prompt).context("failed to read password")
 }
