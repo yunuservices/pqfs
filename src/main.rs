@@ -28,5 +28,6 @@ fn main() -> Result<()> {
         cli::Command::Share(args) => commands::share(args),
         cli::Command::Revoke(args) => commands::revoke(args),
         cli::Command::Passwd(args) => commands::passwd(args),
+        cli::Command::Rekey(args) => commands::rekey(args),
     }
 }

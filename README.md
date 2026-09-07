@@ -84,6 +84,7 @@ pqfs slots <BACKEND>                list the key slots of a volume
 pqfs share <BACKEND> --to <PUBFILE> give a recipient their own slot
 pqfs revoke <BACKEND> --slot <N>    remove a slot
 pqfs passwd <BACKEND>               replace the password slot
+pqfs rekey <BACKEND>                retire the current master key
 ```
 
 Every command that opens a volume takes the same credential flags:
@@ -146,14 +147,32 @@ The recipient now mounts the volume with their key and no password at all:
 pqfs mount ~/pqfs-backend ~/pqfs-mnt --identity ~/.pqfs/alice.key
 ```
 
-Revoking a slot removes that credential's access. The volume itself is not
-re-encrypted, so anyone who copied the ciphertext *and* held the slot while it
-existed can still open their copy — revocation stops future access, not past
-disclosure:
+Revoking a slot removes that credential from the live volume:
 
 ```bash
 pqfs revoke ~/pqfs-backend --slot 1
 ```
+
+Revocation on its own is not enough. A revoked recipient who kept a copy of
+the old header still holds a slot wrapping the master key, and that key still
+protects the volume — pairing the retained header with a later copy of the
+data reads everything written *after* the revocation. `pqfs rekey` closes
+that by retiring the master key:
+
+```bash
+pqfs rekey ~/pqfs-backend
+```
+
+Rekeying draws a new master key, rewraps every remaining slot, rewraps the
+per-file keys, and re-encrypts the file names and the index. File contents are
+never re-encrypted, so the cost scales with the number of files rather than
+their size. The swap is committed atomically: if the process dies partway, the
+next command completes it.
+
+What rekeying cannot do is take back what was already handed over. A copy the
+recipient made while their slot was valid stays readable — revocation and
+rekeying stop future access, never past disclosure. Rekey after every
+revocation you actually care about.
 
 `pqfs slots` is the only command that does not need a credential; slot labels
 and kinds are stored in the clear so you can see who has access before
@@ -195,6 +214,8 @@ After initialization, the encrypted backend (`~/pqfs-backend`) contains:
   copy of the master key wrapped to one credential; nothing in the header is
   usable without one of them.
 - `pqfs.index` — encrypted directory index
+- `pqfs.rekey`, `pqfs.header.new`, `pqfs.index.new` — present only while a
+  rekey is committing; the next command finishes the swap
 - `data/` — per-inode encrypted file contents, stored as independently
   encrypted blocks
 
@@ -230,9 +251,12 @@ After initialization, the encrypted backend (`~/pqfs-backend`) contains:
 - **Rollback / snapshot attacks.** The backend has no versioning or integrity
   log; an attacker with write access can replay an older `pqfs.index` or data
   file.
-- **Revoked recipients who kept a copy.** Revoking a slot removes future
-  access. It does not re-encrypt the volume, so a recipient who copied the
-  ciphertext while their slot existed can still open that copy.
+- **Data a recipient already copied.** Revoking a slot and rekeying stop future
+  access, but a copy taken while the slot was valid stays readable. Nothing in
+  the design can undo a disclosure that already happened.
+- **Revocation without rekeying.** If you revoke a slot but do not run
+  `pqfs rekey`, a recipient who kept the old header can still derive the master
+  key and read data written after the revocation.
 - **Multi-user access control.** `pqfs` does not implement its own user model;
   access is governed by the UNIX permissions of the FUSE mountpoint.
 - **Side channels and Denial of Service.** File sizes, directory structure,
@@ -282,7 +306,7 @@ After initialization, the encrypted backend (`~/pqfs-backend`) contains:
 - [x] Key slots, volume sharing, and revocation
 - [x] Block-based file encryption
 - [ ] Hardware-backed identities (TPM / PKCS#11)
-- [ ] Re-key a volume so revocation also invalidates copied ciphertext
+- [x] Re-key a volume so revocation also retires the master key
 
 ## License
 

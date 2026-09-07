@@ -36,6 +36,9 @@ pub enum Command {
 
     /// Replace the password slot of a volume.
     Passwd(PasswdArgs),
+
+    /// Retire the current master key so revoked slots cannot open copies.
+    Rekey(PasswdArgs),
 }
 
 #[derive(Parser, Debug)]

@@ -1,11 +1,12 @@
 mod blocks;
 mod entry;
-mod inner;
+pub(crate) mod inner;
 mod ops;
 mod wrapper;
 
 use std::time::Duration;
 
+pub(crate) use inner::rekey_index;
 pub use wrapper::Pqfs;
 
 pub(crate) const INDEX_FILE: &str = "pqfs.index";

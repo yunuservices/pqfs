@@ -35,8 +35,7 @@ impl Crypto {
             bail!("volume already exists at {}", backend.display());
         }
 
-        let mut master_key = Zeroizing::new([0u8; KEY_LEN]);
-        rand::rng().fill_bytes(master_key.as_mut_slice());
+        let master_key = random_master_key();
 
         let mut volume_id = [0u8; VOLUME_ID_LEN];
         rand::rng().fill_bytes(&mut volume_id);
@@ -86,6 +85,7 @@ impl Crypto {
 }
 
 pub(crate) fn read_header(backend: &Path) -> Result<VolumeHeader> {
+    recover(backend)?;
     let header_path = backend.join(Crypto::HEADER_FILE);
     let data = fs::read(&header_path)
         .with_context(|| format!("failed to read {}", header_path.display()))?;
@@ -168,6 +168,12 @@ pub(crate) fn recipient_slot(
     })
 }
 
+pub(crate) fn random_master_key() -> SecretKey {
+    let mut key = Zeroizing::new([0u8; KEY_LEN]);
+    rand::rng().fill_bytes(key.as_mut_slice());
+    key
+}
+
 pub(crate) fn password_slot(
     password: &str,
     volume_id: &[u8],
@@ -182,6 +188,65 @@ pub(crate) fn password_slot(
         kdf,
         wrapped_master_key: wrap_master_key(kek.as_slice(), volume_id, master_key)?,
     })
+}
+
+pub(crate) const REKEY_MARKER: &str = "pqfs.rekey";
+pub(crate) const HEADER_STAGING: &str = "pqfs.header.new";
+pub(crate) const INDEX_STAGING: &str = "pqfs.index.new";
+
+fn sync_dir(backend: &Path) -> Result<()> {
+    fs::File::open(backend)?.sync_all()?;
+    Ok(())
+}
+
+fn write_synced(path: &Path, data: &[u8]) -> Result<()> {
+    let mut file =
+        fs::File::create(path).with_context(|| format!("failed to create {}", path.display()))?;
+    file.write_all(data)?;
+    file.sync_all()?;
+    Ok(())
+}
+
+/// Finish a rekey that was interrupted after its commit point.
+pub(crate) fn recover(backend: &Path) -> Result<()> {
+    let marker = backend.join(REKEY_MARKER);
+    if !marker.exists() {
+        return Ok(());
+    }
+
+    let header_staging = backend.join(HEADER_STAGING);
+    let index_staging = backend.join(INDEX_STAGING);
+    if !header_staging.exists() || !index_staging.exists() {
+        bail!("volume has an incomplete rekey and the staged files are missing");
+    }
+
+    fs::rename(&index_staging, backend.join(crate::fs::INDEX_FILE))?;
+    fs::rename(&header_staging, backend.join(Crypto::HEADER_FILE))?;
+    sync_dir(backend)?;
+    fs::remove_file(&marker)?;
+    sync_dir(backend)?;
+    Ok(())
+}
+
+/// Swap in a new header and index together. The marker is the commit point:
+/// once it is on disk the new pair is authoritative, and `recover` finishes
+/// the swap on the next open if the process dies here.
+pub(crate) fn commit_rekey(
+    backend: &Path,
+    header: &mut VolumeHeader,
+    master_key: &[u8],
+    index: &[u8],
+) -> Result<()> {
+    seal_header(header, master_key)?;
+
+    write_synced(&backend.join(INDEX_STAGING), index)?;
+    write_synced(&backend.join(HEADER_STAGING), &bincode::serialize(header)?)?;
+    sync_dir(backend)?;
+
+    write_synced(&backend.join(REKEY_MARKER), b"1")?;
+    sync_dir(backend)?;
+
+    recover(backend)
 }
 
 pub(crate) fn write_header(
@@ -340,6 +405,94 @@ mod tests {
         .unwrap();
 
         assert!(Crypto::load("pw", dir.path()).is_err());
+    }
+
+    #[test]
+    fn rekey_replaces_every_slot_and_the_master_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let before = volume(dir.path());
+        let identity = Identity::generate().unwrap();
+
+        let mut header = read_header(dir.path()).unwrap();
+        let old_master = open_master_key(&header, &Unlock::Password("pw")).unwrap();
+        header.slots.push(
+            recipient_slot(
+                &identity.public().unwrap(),
+                "alice",
+                &header.volume_id,
+                old_master.as_slice(),
+            )
+            .unwrap(),
+        );
+        write_header(dir.path(), &mut header, old_master.as_slice()).unwrap();
+
+        let stale = read_header(dir.path()).unwrap();
+        let new_master = random_master_key();
+        let kdf = test_kdf();
+        header.slots = vec![
+            password_slot("pw", &header.volume_id, new_master.as_slice(), kdf).unwrap(),
+            recipient_slot(
+                &identity.public().unwrap(),
+                "alice",
+                &header.volume_id,
+                new_master.as_slice(),
+            )
+            .unwrap(),
+        ];
+        commit_rekey(dir.path(), &mut header, new_master.as_slice(), b"index").unwrap();
+
+        let reloaded = read_header(dir.path()).unwrap();
+        assert_eq!(
+            open_master_key(&reloaded, &Unlock::Password("pw"))
+                .unwrap()
+                .as_slice(),
+            new_master.as_slice()
+        );
+        assert_eq!(
+            open_master_key(&reloaded, &Unlock::Identity(&identity))
+                .unwrap()
+                .as_slice(),
+            new_master.as_slice()
+        );
+
+        let recovered = open_master_key(&stale, &Unlock::Identity(&identity)).unwrap();
+        assert_ne!(recovered.as_slice(), new_master.as_slice());
+        assert_eq!(
+            fs::read(dir.path().join(crate::fs::INDEX_FILE)).unwrap(),
+            b"index"
+        );
+        drop(before);
+    }
+
+    #[test]
+    fn recover_finishes_an_interrupted_rekey() {
+        let dir = tempfile::tempdir().unwrap();
+        let _ = volume(dir.path());
+
+        fs::write(dir.path().join(HEADER_STAGING), b"new-header").unwrap();
+        fs::write(dir.path().join(INDEX_STAGING), b"new-index").unwrap();
+        fs::write(dir.path().join(REKEY_MARKER), b"1").unwrap();
+
+        recover(dir.path()).unwrap();
+
+        assert!(!dir.path().join(REKEY_MARKER).exists());
+        assert!(!dir.path().join(HEADER_STAGING).exists());
+        assert_eq!(
+            fs::read(dir.path().join(Crypto::HEADER_FILE)).unwrap(),
+            b"new-header"
+        );
+        assert_eq!(
+            fs::read(dir.path().join(crate::fs::INDEX_FILE)).unwrap(),
+            b"new-index"
+        );
+    }
+
+    #[test]
+    fn recover_reports_a_rekey_whose_staging_vanished() {
+        let dir = tempfile::tempdir().unwrap();
+        let _ = volume(dir.path());
+        fs::write(dir.path().join(REKEY_MARKER), b"1").unwrap();
+        assert!(recover(dir.path()).is_err());
     }
 
     #[test]

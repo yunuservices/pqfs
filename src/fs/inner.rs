@@ -2,7 +2,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::ffi::OsStr;
 use std::fs;
 use std::io::Write;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use fuser::{FUSE_ROOT_ID, FileAttr, FileType};
@@ -31,7 +31,9 @@ impl PqfsInner {
         let (entries, next_ino) = if index_path.exists() {
             let data = fs::read(&index_path)
                 .with_context(|| format!("failed to read {}", index_path.display()))?;
-            let plaintext = crypto.decrypt(&data).context("failed to decrypt index")?;
+            let plaintext = crypto.decrypt(&data).context(
+                "failed to decrypt index (the volume may have been rekeyed since this header was written)",
+            )?;
             let map: BTreeMap<u64, Entry> = bincode::deserialize(&plaintext)?;
             let next_ino = map.keys().next_back().copied().unwrap_or(FUSE_ROOT_ID) + 1;
             (map, next_ino)
@@ -226,6 +228,40 @@ impl PqfsInner {
         self.next_ino += 1;
         ino
     }
+}
+
+/// Re-encrypt the directory index under a new master key. File contents are
+/// left untouched: only the wrapped per-file keys and the encrypted names are
+/// rewritten, so the cost is proportional to the number of entries.
+pub(crate) fn rekey_index(backend: &Path, old: &Crypto, new: &Crypto) -> Result<Vec<u8>> {
+    let index_path = backend.join(INDEX_FILE);
+    let mut entries: BTreeMap<u64, Entry> = if index_path.exists() {
+        let data = fs::read(&index_path)
+            .with_context(|| format!("failed to read {}", index_path.display()))?;
+        let plaintext = old.decrypt(&data).context("failed to decrypt index")?;
+        bincode::deserialize(&plaintext)?
+    } else {
+        BTreeMap::new()
+    };
+
+    for entry in entries.values_mut() {
+        if !entry.content_key.is_empty() {
+            let content_key = old
+                .decrypt(&entry.content_key)
+                .with_context(|| format!("failed to unwrap the key of inode {}", entry.ino))?;
+            entry.content_key = new.encrypt(&content_key)?;
+        }
+
+        if !entry.name_encrypted.is_empty() {
+            let name = old
+                .decrypt_filename(&entry.name_encrypted)
+                .with_context(|| format!("failed to decrypt the name of inode {}", entry.ino))?;
+            entry.name_encrypted = new.encrypt_filename(&name)?;
+            entry.name_hash = new.hash_filename(&name);
+        }
+    }
+
+    new.encrypt(&bincode::serialize(&entries)?)
 }
 
 #[cfg(test)]

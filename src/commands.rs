@@ -3,7 +3,7 @@ use std::path::Path;
 use anyhow::{Result, bail};
 
 use crate::cli::{KeygenArgs, PasswdArgs, RevokeArgs, ShareArgs, VolumeArgs, prompt_password};
-use crate::crypto::{Identity, KeySlot, PublicIdentity, volume};
+use crate::crypto::{Crypto, Identity, KeySlot, PublicIdentity, volume};
 
 pub fn keygen(args: KeygenArgs) -> Result<()> {
     if args.out.exists() {
@@ -119,6 +119,59 @@ pub fn passwd(mut args: PasswdArgs) -> Result<()> {
     volume::write_header(&args.backend, &mut header, master_key.as_slice())?;
 
     println!("password slot rewrapped");
+    Ok(())
+}
+
+pub fn rekey(mut args: PasswdArgs) -> Result<()> {
+    args.credential.resolve()?;
+    let identity = args.credential.identity_file()?;
+    let old = Crypto::unlock(&args.backend, args.credential.unlock(&identity)?)?;
+
+    let mut header = volume::read_header(&args.backend)?;
+    let new_master_key = volume::random_master_key();
+
+    let mut slots = Vec::with_capacity(header.slots.len());
+    for (index, slot) in header.slots.iter().enumerate() {
+        slots.push(match slot {
+            KeySlot::Password { kdf, .. } => {
+                let password = args.credential.require_password().map_err(|_| {
+                    anyhow::anyhow!(
+                        "slot {index} is a password slot; pass --password so it can be rewrapped"
+                    )
+                })?;
+                volume::password_slot(password, &header.volume_id, new_master_key.as_slice(), *kdf)?
+            }
+            KeySlot::Recipient {
+                label,
+                kem_param,
+                kem_public_key,
+                ..
+            } => volume::recipient_slot(
+                &PublicIdentity {
+                    kem_param: *kem_param,
+                    kem_public_key: kem_public_key.clone(),
+                },
+                label,
+                &header.volume_id,
+                new_master_key.as_slice(),
+            )?,
+        });
+    }
+    header.slots = slots;
+
+    let new = Crypto::from_master_key(new_master_key.as_slice(), header.clone())?;
+    let index = crate::fs::rekey_index(&args.backend, &old, &new)?;
+    volume::commit_rekey(
+        &args.backend,
+        &mut header,
+        new_master_key.as_slice(),
+        &index,
+    )?;
+
+    println!(
+        "master key retired; {} slot(s) rewrapped",
+        header.slots.len()
+    );
     Ok(())
 }
 
