@@ -48,8 +48,8 @@ pub fn share(mut args: ShareArgs) -> Result<()> {
     });
 
     let identity = args.credential.identity_file()?;
-    let mut header = volume::read_header(&args.backend)?;
-    let master_key = volume::open_master_key(&header, &args.credential.unlock(&identity)?)?;
+    let (mut header, master_key) =
+        volume::open(&args.backend, &args.credential.unlock(&identity)?)?;
 
     header.slots.push(volume::recipient_slot(
         &recipient,
@@ -66,8 +66,8 @@ pub fn share(mut args: ShareArgs) -> Result<()> {
 pub fn revoke(mut args: RevokeArgs) -> Result<()> {
     args.credential.resolve()?;
     let identity = args.credential.identity_file()?;
-    let mut header = volume::read_header(&args.backend)?;
-    let master_key = volume::open_master_key(&header, &args.credential.unlock(&identity)?)?;
+    let (mut header, master_key) =
+        volume::open(&args.backend, &args.credential.unlock(&identity)?)?;
 
     if args.slot >= header.slots.len() {
         bail!("no slot {}", args.slot);
@@ -86,8 +86,8 @@ pub fn revoke(mut args: RevokeArgs) -> Result<()> {
 pub fn passwd(mut args: PasswdArgs) -> Result<()> {
     args.credential.resolve()?;
     let identity = args.credential.identity_file()?;
-    let mut header = volume::read_header(&args.backend)?;
-    let master_key = volume::open_master_key(&header, &args.credential.unlock(&identity)?)?;
+    let (mut header, master_key) =
+        volume::open(&args.backend, &args.credential.unlock(&identity)?)?;
 
     let new_password = prompt_password("New volume password: ")?;
     if new_password != prompt_password("Repeat new password: ")? {
@@ -125,9 +125,10 @@ pub fn passwd(mut args: PasswdArgs) -> Result<()> {
 pub fn rekey(mut args: PasswdArgs) -> Result<()> {
     args.credential.resolve()?;
     let identity = args.credential.identity_file()?;
-    let old = Crypto::unlock(&args.backend, args.credential.unlock(&identity)?)?;
+    let (mut header, old_master_key) =
+        volume::open(&args.backend, &args.credential.unlock(&identity)?)?;
+    let old = Crypto::from_master_key(old_master_key.as_slice(), header.clone())?;
 
-    let mut header = volume::read_header(&args.backend)?;
     let new_master_key = volume::random_master_key();
 
     let mut slots = Vec::with_capacity(header.slots.len());

@@ -67,12 +67,7 @@ impl Crypto {
     }
 
     pub(crate) fn unlock(backend: &Path, credential: Unlock<'_>) -> Result<Self> {
-        let header = read_header(backend)?;
-        let master_key = open_master_key(&header, &credential)?;
-        verify_header_mac(
-            derive_header_mac_key(master_key.as_slice())?.as_slice(),
-            &header,
-        )?;
+        let (header, master_key) = open(backend, &credential)?;
         Self::from_master_key(master_key.as_slice(), header)
     }
 
@@ -109,7 +104,17 @@ pub(crate) fn read_header(backend: &Path) -> Result<VolumeHeader> {
     Ok(header)
 }
 
-pub(crate) fn open_master_key(header: &VolumeHeader, credential: &Unlock<'_>) -> Result<SecretKey> {
+pub(crate) fn open(backend: &Path, credential: &Unlock<'_>) -> Result<(VolumeHeader, SecretKey)> {
+    let header = read_header(backend)?;
+    let master_key = open_master_key(&header, credential)?;
+    verify_header_mac(
+        derive_header_mac_key(master_key.as_slice())?.as_slice(),
+        &header,
+    )?;
+    Ok((header, master_key))
+}
+
+fn open_master_key(header: &VolumeHeader, credential: &Unlock<'_>) -> Result<SecretKey> {
     for slot in &header.slots {
         if let Some(master_key) = try_slot(header, slot, credential)? {
             return Ok(master_key);
@@ -405,6 +410,37 @@ mod tests {
         .unwrap();
 
         assert!(Crypto::load("pw", dir.path()).is_err());
+    }
+
+    #[test]
+    fn open_rejects_a_header_modified_without_the_master_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let _ = volume(dir.path());
+        let identity = Identity::generate().unwrap();
+        let attacker = Identity::generate().unwrap();
+
+        let (mut header, master_key) = open(dir.path(), &Unlock::Password("pw")).unwrap();
+        header.slots.push(
+            recipient_slot(
+                &identity.public().unwrap(),
+                "alice",
+                &header.volume_id,
+                master_key.as_slice(),
+            )
+            .unwrap(),
+        );
+        write_header(dir.path(), &mut header, master_key.as_slice()).unwrap();
+
+        if let KeySlot::Recipient { kem_public_key, .. } = &mut header.slots[1] {
+            *kem_public_key = attacker.public().unwrap().kem_public_key;
+        }
+        fs::write(
+            dir.path().join(Crypto::HEADER_FILE),
+            bincode::serialize(&header).unwrap(),
+        )
+        .unwrap();
+
+        assert!(open(dir.path(), &Unlock::Password("pw")).is_err());
     }
 
     #[test]
