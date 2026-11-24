@@ -188,6 +188,7 @@ pub(crate) fn password_slot(
 
 pub(crate) const REKEY_MARKER: &str = "pqfs.rekey";
 pub(crate) const HEADER_STAGING: &str = "pqfs.header.new";
+pub(crate) const HEADER_TMP: &str = "pqfs.header.tmp";
 pub(crate) const INDEX_STAGING: &str = "pqfs.index.new";
 
 fn sync_dir(backend: &Path) -> Result<()> {
@@ -252,7 +253,7 @@ pub(crate) fn write_header(
 ) -> Result<()> {
     seal_header(header, master_key)?;
     let path = backend.join(Crypto::HEADER_FILE);
-    let tmp = path.with_extension("tmp");
+    let tmp = backend.join(HEADER_TMP);
     let data = bincode::serialize(header)?;
 
     let mut file =
@@ -433,6 +434,20 @@ mod tests {
         .unwrap();
 
         assert!(open(dir.path(), &Unlock::Password("pw")).is_err());
+    }
+
+    #[test]
+    fn a_header_write_leaves_an_index_write_in_flight_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let _ = volume(dir.path());
+        let in_flight = dir.path().join(crate::fs::INDEX_TMP);
+        fs::write(&in_flight, b"index in flight").unwrap();
+
+        let (mut header, master_key) = open(dir.path(), &Unlock::Password("pw")).unwrap();
+        write_header(dir.path(), &mut header, master_key.as_slice()).unwrap();
+
+        assert_eq!(fs::read(&in_flight).unwrap(), b"index in flight");
+        assert!(!dir.path().join(HEADER_TMP).exists());
     }
 
     #[test]

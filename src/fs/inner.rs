@@ -9,7 +9,7 @@ use anyhow::{Context, Result};
 use fuser::{FileAttr, INodeNo};
 
 use super::entry::{Entry, EntryKind, Timestamps, file_type, to_system_time};
-use super::{BLOCK_SIZE, INDEX_FILE, ROOT_INO};
+use super::{BLOCK_SIZE, INDEX_FILE, INDEX_TMP, ROOT_INO};
 use crate::crypto::Crypto;
 
 /// The actual filesystem metadata state. It is decoupled from `Crypto` so
@@ -177,7 +177,7 @@ impl PqfsInner {
         let plaintext = bincode::serialize(&self.entries)?;
         let ciphertext = crypto.encrypt(&plaintext)?;
         let index_path = self.backend.join(INDEX_FILE);
-        let tmp = index_path.with_extension("tmp");
+        let tmp = self.backend.join(INDEX_TMP);
 
         let mut file = fs::File::create(&tmp)
             .with_context(|| format!("failed to create {}", tmp.display()))?;
@@ -308,7 +308,7 @@ mod tests {
         inner.save_index(&crypto).unwrap();
         inner.save_index(&crypto).unwrap();
         assert!(dir.path().join(INDEX_FILE).exists());
-        assert!(!dir.path().join("pqfs.tmp").exists());
+        assert!(!dir.path().join(INDEX_TMP).exists());
     }
 
     #[test]
