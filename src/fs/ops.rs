@@ -213,7 +213,7 @@ impl PqfsInner {
             content_key,
             kind: EntryKind::File,
             size: 0,
-            perm: (mode as u16) & 0o777,
+            perm: perm_bits(mode),
             uid: owner.uid,
             gid: owner.gid,
             times: Timestamps::now(),
@@ -269,7 +269,7 @@ impl PqfsInner {
             content_key: Vec::new(),
             kind: EntryKind::Dir,
             size: 0,
-            perm: (mode as u16) & 0o777,
+            perm: perm_bits(mode),
             uid: owner.uid,
             gid: owner.gid,
             times: Timestamps::now(),
@@ -433,7 +433,7 @@ impl PqfsInner {
         };
 
         if let Some(mode) = mode {
-            entry.perm = (mode as u16) & 0o777;
+            entry.perm = perm_bits(mode);
         }
         if let Some(uid) = uid {
             entry.uid = uid;
@@ -615,6 +615,10 @@ impl PqfsInner {
 }
 
 const DOT_ENTRIES: u64 = 2;
+
+fn perm_bits(mode: u32) -> u16 {
+    (mode & 0o7777) as u16
+}
 
 fn rename_flags_error(flags: u32, target_exists: bool) -> Option<i32> {
     if flags & !libc::RENAME_NOREPLACE != 0 {
@@ -830,6 +834,14 @@ mod tests {
             listed.extend(page);
         }
         assert_eq!(names(&listed), [".", "..", "a", "b", "c"]);
+    }
+
+    #[test]
+    fn perm_bits_keep_the_special_bits_and_drop_the_file_type() {
+        assert_eq!(perm_bits(0o100644), 0o644);
+        assert_eq!(perm_bits(0o041777), 0o1777);
+        assert_eq!(perm_bits(0o104755), 0o4755);
+        assert_eq!(perm_bits(0o102755), 0o2755);
     }
 
     #[test]
