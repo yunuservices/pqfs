@@ -1,6 +1,6 @@
 # syntax=docker/dockerfile:1
 # Multi-stage build for pqfs.
-FROM rust:1.86-bookworm AS builder
+FROM rust:1.99-bookworm AS builder
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     libfuse3-dev \
