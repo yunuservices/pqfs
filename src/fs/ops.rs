@@ -6,7 +6,7 @@ use fuser::{
     Errno, FileHandle, FileType, FopenFlags, Generation, INodeNo, ReplyAttr, ReplyCreate,
     ReplyData, ReplyDirectory, ReplyEmpty, ReplyEntry, ReplyOpen, ReplyWrite, TimeOrNow,
 };
-use libc::{EEXIST, EINVAL, EIO};
+use libc::{EEXIST, EINVAL, EIO, ENOENT, ENOTDIR};
 use tracing::{error, warn};
 use zeroize::Zeroizing;
 
@@ -124,37 +124,52 @@ impl PqfsInner {
         offset: u64,
         mut reply: ReplyDirectory,
     ) {
-        let Some(parent) = self.entries.get(&ino).cloned() else {
-            reply.error(Errno::ENOENT);
-            return;
+        let page = self.readdir_page(crypto, ino, offset, |ino, cookie, kind, name| {
+            reply.add(INodeNo(ino), cookie, kind, name)
+        });
+        match page {
+            Ok(()) => reply.ok(),
+            Err(code) => reply.error(Errno::from_i32(code)),
+        }
+    }
+
+    pub(crate) fn readdir_page(
+        &self,
+        crypto: &Crypto,
+        ino: u64,
+        offset: u64,
+        mut add: impl FnMut(u64, u64, FileType, &str) -> bool,
+    ) -> Result<(), i32> {
+        let Some(dir) = self.entries.get(&ino) else {
+            return Err(ENOENT);
         };
-        if !matches!(parent.kind, EntryKind::Dir) {
-            reply.error(Errno::ENOTDIR);
-            return;
+        if !matches!(dir.kind, EntryKind::Dir) {
+            return Err(ENOTDIR);
         }
 
-        let mut entries: Vec<(u64, FileType, String)> = vec![
-            (ino, FileType::Directory, ".".to_string()),
-            (parent.parent, FileType::Directory, "..".to_string()),
-        ];
-        for child in self.child_inodes(ino) {
-            let name = match crypto.decrypt_filename(&child.name_encrypted) {
-                Ok(n) => n,
-                Err(e) => {
+        for (cookie, dot_ino, name) in [(1, ino, "."), (2, dir.parent, "..")] {
+            if cookie > offset && add(dot_ino, cookie, FileType::Directory, name) {
+                return Ok(());
+            }
+        }
+
+        for child in self.child_inodes_after(ino, offset.saturating_sub(DOT_ENTRIES)) {
+            let name = crypto
+                .decrypt_filename(&child.name_encrypted)
+                .map_err(|e| {
                     error!("filename decryption error for inode {}: {}", child.ino, e);
-                    reply.error(Errno::EIO);
-                    return;
-                }
-            };
-            entries.push((child.ino, file_type(&child.kind), name));
-        }
-
-        for (i, (ino, kind, name)) in entries.into_iter().enumerate().skip(offset as usize) {
-            if reply.add(INodeNo(ino), (i + 1) as u64, kind, &name) {
+                    EIO
+                })?;
+            if add(
+                child.ino,
+                child.ino + DOT_ENTRIES,
+                file_type(&child.kind),
+                &name,
+            ) {
                 break;
             }
         }
-        reply.ok();
+        Ok(())
     }
 
     pub(crate) fn create(
@@ -596,6 +611,8 @@ impl PqfsInner {
     }
 }
 
+const DOT_ENTRIES: u64 = 2;
+
 fn rename_flags_error(flags: u32, target_exists: bool) -> Option<i32> {
     if flags & !libc::RENAME_NOREPLACE != 0 {
         return Some(EINVAL);
@@ -727,6 +744,89 @@ mod tests {
             assert!(plaintext[0..1024].iter().all(|b| *b == b'A'));
             assert!(plaintext[4096..5120].iter().all(|b| *b == b'B'));
         }
+    }
+
+    fn named_file(inner: &mut PqfsInner, crypto: &Crypto, name: &str) -> u64 {
+        let ino = inner.allocate_ino();
+        inner.insert_entry(Entry {
+            ino,
+            parent: ROOT_INO,
+            name_hash: crypto.hash_filename(name),
+            name_encrypted: crypto.encrypt_filename(name).unwrap(),
+            content_key: Vec::new(),
+            kind: EntryKind::File,
+            size: 0,
+            perm: 0o644,
+            uid: 0,
+            gid: 0,
+            times: Timestamps::now(),
+            link_target: Vec::new(),
+        });
+        ino
+    }
+
+    fn readdir_page(
+        inner: &PqfsInner,
+        crypto: &Crypto,
+        offset: u64,
+        limit: usize,
+    ) -> Vec<(u64, String)> {
+        let mut out = Vec::new();
+        inner
+            .readdir_page(crypto, ROOT_INO, offset, |_, cookie, _, name| {
+                if out.len() == limit {
+                    return true;
+                }
+                out.push((cookie, name.to_string()));
+                false
+            })
+            .unwrap();
+        out
+    }
+
+    fn names(page: &[(u64, String)]) -> Vec<&str> {
+        page.iter().map(|(_, name)| name.as_str()).collect()
+    }
+
+    #[test]
+    fn readdir_resumes_after_entries_are_removed() {
+        let dir = tempfile::tempdir().unwrap();
+        let crypto = Crypto::init_for_tests("pw", dir.path()).unwrap();
+        let mut inner = PqfsInner::load(dir.path().to_path_buf(), &crypto).unwrap();
+        let inodes: Vec<u64> = ["a", "b", "c", "d", "e"]
+            .iter()
+            .map(|name| named_file(&mut inner, &crypto, name))
+            .collect();
+
+        let first = readdir_page(&inner, &crypto, 0, 3);
+        assert_eq!(names(&first), [".", "..", "a"]);
+
+        inner.remove_entry(inodes[0]);
+        inner.remove_entry(inodes[1]);
+        let rest = readdir_page(&inner, &crypto, first.last().unwrap().0, 100);
+        assert_eq!(names(&rest), ["c", "d", "e"]);
+    }
+
+    #[test]
+    fn readdir_pages_list_every_entry_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let crypto = Crypto::init_for_tests("pw", dir.path()).unwrap();
+        let mut inner = PqfsInner::load(dir.path().to_path_buf(), &crypto).unwrap();
+        for name in ["a", "b", "c"] {
+            named_file(&mut inner, &crypto, name);
+        }
+
+        let mut listed = Vec::new();
+        let mut offset = 0;
+        loop {
+            let page = readdir_page(&inner, &crypto, offset, 1);
+            let Some((cookie, _)) = page.last() else {
+                break;
+            };
+            offset = *cookie;
+            listed.extend(page);
+        }
+        assert_eq!(names(&listed), [".", "..", "a", "b", "c"]);
     }
 
     #[test]

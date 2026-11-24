@@ -2,6 +2,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::ffi::OsStr;
 use std::fs;
 use std::io::Write;
+use std::ops::Bound;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
@@ -145,11 +146,15 @@ impl PqfsInner {
         self.link(ino, new_parent, new_name_hash);
     }
 
-    pub(crate) fn child_inodes(&self, parent: u64) -> impl Iterator<Item = &Entry> {
+    pub(crate) fn child_inodes_after(
+        &self,
+        parent: u64,
+        after: u64,
+    ) -> impl Iterator<Item = &Entry> {
         self.by_parent
             .get(&parent)
             .into_iter()
-            .flatten()
+            .flat_map(move |set| set.range((Bound::Excluded(after), Bound::Unbounded)))
             .filter_map(|ino| self.entries.get(ino))
     }
 
@@ -434,7 +439,7 @@ mod tests {
             .find_child(&crypto, ROOT_INO, std::ffi::OsStr::new(name))
             .unwrap();
         assert_eq!(found.ino, ino);
-        assert_eq!(reloaded.child_inodes(ROOT_INO).count(), 1);
+        assert_eq!(reloaded.child_inodes_after(ROOT_INO, 0).count(), 1);
         assert!(reloaded.has_children(ROOT_INO));
         assert!(!reloaded.has_children(ino));
     }
@@ -492,7 +497,7 @@ mod tests {
             .find_child(&crypto, target_dir, std::ffi::OsStr::new("yeni"))
             .unwrap();
         assert_eq!(moved.ino, ino);
-        assert_eq!(inner.child_inodes(target_dir).count(), 1);
+        assert_eq!(inner.child_inodes_after(target_dir, 0).count(), 1);
     }
 
     #[test]
