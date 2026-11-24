@@ -398,12 +398,13 @@ impl Filesystem for Pqfs {
         _umask: u32,
         _flags: i32,
         _kill_suid_gid: bool,
-        _owner: Owner,
+        owner: Owner,
         reply: ReplyCreate,
     ) {
         let parent = parent.0;
         let crypto = self.crypto.as_ref();
-        self.write_inner().create(crypto, parent, name, mode, reply);
+        self.write_inner()
+            .create(crypto, parent, name, mode, owner, reply);
     }
 
     fn mkdir(
@@ -413,12 +414,13 @@ impl Filesystem for Pqfs {
         name: &OsStr,
         mode: u32,
         _umask: u32,
-        _owner: Owner,
+        owner: Owner,
         reply: ReplyEntry,
     ) {
         let parent = parent.0;
         let crypto = self.crypto.as_ref();
-        self.write_inner().mkdir(crypto, parent, name, mode, reply);
+        self.write_inner()
+            .mkdir(crypto, parent, name, mode, owner, reply);
     }
 
     fn unlink(&self, _req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEmpty) {
@@ -451,13 +453,13 @@ impl Filesystem for Pqfs {
         parent: INodeNo,
         link_name: &OsStr,
         target: &Path,
-        _owner: Owner,
+        owner: Owner,
         reply: ReplyEntry,
     ) {
         let parent = parent.0;
         let crypto = Arc::clone(&self.crypto);
         self.write_inner()
-            .symlink(crypto.as_ref(), parent, link_name, target, reply);
+            .symlink(crypto.as_ref(), parent, link_name, target, owner, reply);
     }
 
     fn readlink(&self, _req: &Request, ino: INodeNo, reply: ReplyData) {

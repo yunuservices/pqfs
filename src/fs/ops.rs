@@ -3,7 +3,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use fuser::{
-    Errno, FileHandle, FileType, FopenFlags, Generation, INodeNo, ReplyAttr, ReplyCreate,
+    Errno, FileHandle, FileType, FopenFlags, Generation, INodeNo, Owner, ReplyAttr, ReplyCreate,
     ReplyData, ReplyDirectory, ReplyEmpty, ReplyEntry, ReplyOpen, ReplyWrite, TimeOrNow,
 };
 use libc::{EEXIST, EINVAL, EIO, ENOENT, ENOTDIR};
@@ -178,6 +178,7 @@ impl PqfsInner {
         parent: u64,
         name: &OsStr,
         mode: u32,
+        owner: Owner,
         reply: ReplyCreate,
     ) {
         if self.find_child(crypto, parent, name).is_some() {
@@ -213,8 +214,8 @@ impl PqfsInner {
             kind: EntryKind::File,
             size: 0,
             perm: (mode as u16) & 0o777,
-            uid: unsafe { libc::getuid() },
-            gid: unsafe { libc::getgid() },
+            uid: owner.uid,
+            gid: owner.gid,
             times: Timestamps::now(),
             link_target: Vec::new(),
         };
@@ -241,6 +242,7 @@ impl PqfsInner {
         parent: u64,
         name: &OsStr,
         mode: u32,
+        owner: Owner,
         reply: ReplyEntry,
     ) {
         if self.find_child(crypto, parent, name).is_some() {
@@ -268,8 +270,8 @@ impl PqfsInner {
             kind: EntryKind::Dir,
             size: 0,
             perm: (mode as u16) & 0o777,
-            uid: unsafe { libc::getuid() },
-            gid: unsafe { libc::getgid() },
+            uid: owner.uid,
+            gid: owner.gid,
             times: Timestamps::now(),
             link_target: Vec::new(),
         };
@@ -290,6 +292,7 @@ impl PqfsInner {
         parent: u64,
         name: &OsStr,
         target: &Path,
+        owner: Owner,
         reply: ReplyEntry,
     ) {
         if self.find_child(crypto, parent, name).is_some() {
@@ -328,8 +331,8 @@ impl PqfsInner {
             kind: EntryKind::Symlink,
             size: target.len() as u64,
             perm: 0o777,
-            uid: unsafe { libc::getuid() },
-            gid: unsafe { libc::getgid() },
+            uid: owner.uid,
+            gid: owner.gid,
             times: Timestamps::now(),
             link_target,
         };
