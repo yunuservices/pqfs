@@ -456,6 +456,7 @@ impl PqfsInner {
         ino == ancestor
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn rename(
         &mut self,
         crypto: &Crypto,
@@ -463,12 +464,19 @@ impl PqfsInner {
         name: &OsStr,
         newparent: u64,
         newname: &OsStr,
+        flags: u32,
         reply: ReplyEmpty,
     ) {
         let Some(source) = self.find_child(crypto, parent, name).cloned() else {
             reply.error(ENOENT);
             return;
         };
+
+        let target_exists = self.find_child(crypto, newparent, newname).is_some();
+        if let Some(code) = rename_flags_error(flags, target_exists) {
+            reply.error(code);
+            return;
+        }
 
         match self.entries.get(&newparent) {
             Some(entry) if matches!(entry.kind, EntryKind::Dir) => {}
@@ -582,6 +590,16 @@ impl PqfsInner {
         }
         reply.written(written);
     }
+}
+
+fn rename_flags_error(flags: u32, target_exists: bool) -> Option<i32> {
+    if flags & !libc::RENAME_NOREPLACE != 0 {
+        return Some(EINVAL);
+    }
+    if flags & libc::RENAME_NOREPLACE != 0 && target_exists {
+        return Some(EEXIST);
+    }
+    None
 }
 
 fn ensure_content_key(crypto: &Crypto, entry: &Entry) -> Result<Vec<u8>, i32> {
@@ -705,6 +723,24 @@ mod tests {
             assert!(plaintext[0..1024].iter().all(|b| *b == b'A'));
             assert!(plaintext[4096..5120].iter().all(|b| *b == b'B'));
         }
+    }
+
+    #[test]
+    fn rename_flags_are_honoured() {
+        assert_eq!(rename_flags_error(0, true), None);
+        assert_eq!(rename_flags_error(libc::RENAME_NOREPLACE, false), None);
+        assert_eq!(
+            rename_flags_error(libc::RENAME_NOREPLACE, true),
+            Some(EEXIST)
+        );
+        assert_eq!(
+            rename_flags_error(libc::RENAME_EXCHANGE, false),
+            Some(EINVAL)
+        );
+        assert_eq!(
+            rename_flags_error(libc::RENAME_WHITEOUT, false),
+            Some(EINVAL)
+        );
     }
 
     #[test]

@@ -373,12 +373,19 @@ impl Filesystem for Pqfs {
         name: &OsStr,
         newparent: u64,
         newname: &OsStr,
-        _flags: u32,
+        flags: u32,
         reply: ReplyEmpty,
     ) {
         let crypto = Arc::clone(&self.crypto);
-        self.write_inner()
-            .rename(crypto.as_ref(), parent, name, newparent, newname, reply);
+        self.write_inner().rename(
+            crypto.as_ref(),
+            parent,
+            name,
+            newparent,
+            newname,
+            flags,
+            reply,
+        );
     }
 
     fn readdir(
