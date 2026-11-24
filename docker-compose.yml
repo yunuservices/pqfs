@@ -27,20 +27,16 @@ services:
       sh -c '
         set -e
         mkdir -p /mnt/pqfs
-        if [ ! -f /data/pqfs.header ]; then
-          echo "[*] Creating new pqfs volume..."
-          pqfs /data /mnt/pqfs --password smoke-test --init
-        fi
-        echo "[*] Mounting pqfs..."
-        pqfs /data /mnt/pqfs --password smoke-test &
-        sleep 2
+        echo "[*] Mounting pqfs (creating the volume if needed)..."
+        pqfs mount /data /mnt/pqfs --password smoke-test --init &
+        timeout 30 sh -c "until mountpoint -q /mnt/pqfs; do sleep 0.5; done"
         echo "[*] Writing test files..."
         echo "hello from pqfs" > /mnt/pqfs/hello.txt
-        mkdir /mnt/pqfs/dir
+        mkdir -p /mnt/pqfs/dir
         echo "nested content" > /mnt/pqfs/dir/nested.txt
         echo "[*] Reading back..."
-        cat /mnt/pqfs/hello.txt
-        cat /mnt/pqfs/dir/nested.txt
+        grep -qx "hello from pqfs" /mnt/pqfs/hello.txt
+        grep -qx "nested content" /mnt/pqfs/dir/nested.txt
         echo "[*] Listing files..."
         ls -la /mnt/pqfs
         echo "[*] Unmounting..."
