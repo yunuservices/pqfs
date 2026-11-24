@@ -8,10 +8,10 @@ use std::thread::{self, JoinHandle};
 
 use anyhow::{Context, Result, bail};
 use fuser::{
-    Filesystem, MountOption, ReplyAttr, ReplyCreate, ReplyData, ReplyDirectory, ReplyEmpty,
-    ReplyEntry, ReplyOpen, ReplyStatfs, ReplyWrite, Request, TimeOrNow,
+    BsdFileFlags, Config, Errno, FileHandle, Filesystem, INodeNo, LockOwner, MountOption,
+    OpenFlags, Owner, RenameFlags, ReplyAttr, ReplyCreate, ReplyData, ReplyDirectory, ReplyEmpty,
+    ReplyEntry, ReplyOpen, ReplyStatfs, ReplyWrite, Request, TimeOrNow, WriteFlags,
 };
-use libc::{EINVAL, EIO, EISDIR, ENOENT};
 use std::time::SystemTime;
 use tracing::{debug, error};
 
@@ -108,7 +108,9 @@ impl Pqfs {
         }
 
         debug!("pqfs mounted at {}", args.mountpoint.display());
-        fuser::mount2(fs, &args.mountpoint, &mount_options)
+        let mut config = Config::default();
+        config.mount_options = mount_options;
+        fuser::mount(fs, &args.mountpoint, &config)
             .with_context(|| format!("failed to mount at {}", args.mountpoint.display()))?;
         Ok(())
     }
@@ -156,27 +158,30 @@ impl Drop for Pqfs {
 }
 
 impl Filesystem for Pqfs {
-    fn lookup(&mut self, _req: &Request<'_>, parent: u64, name: &OsStr, reply: ReplyEntry) {
+    fn lookup(&self, _req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEntry) {
+        let parent = parent.0;
         let crypto = self.crypto.as_ref();
         self.read_inner().lookup(crypto, parent, name, reply);
     }
 
-    fn getattr(&mut self, _req: &Request<'_>, ino: u64, reply: ReplyAttr) {
+    fn getattr(&self, _req: &Request, ino: INodeNo, _fh: Option<FileHandle>, reply: ReplyAttr) {
+        let ino = ino.0;
         let crypto = self.crypto.as_ref();
         self.read_inner().getattr(crypto, ino, reply);
     }
 
     fn read(
-        &mut self,
-        _req: &Request<'_>,
-        ino: u64,
-        _fh: u64,
-        offset: i64,
+        &self,
+        _req: &Request,
+        ino: INodeNo,
+        _fh: FileHandle,
+        offset: u64,
         size: u32,
-        _flags: i32,
-        _lock_owner: Option<u64>,
+        _flags: OpenFlags,
+        _lock_owner: Option<LockOwner>,
         reply: ReplyData,
     ) {
+        let ino = ino.0;
         let inner = Arc::clone(&self.inner);
         let crypto = Arc::clone(&self.crypto);
         let lock = self.inode_lock(ino);
@@ -198,7 +203,7 @@ impl Filesystem for Pqfs {
                         match inner.entries.get(&ino) {
                             Some(entry) => entry.clone(),
                             None => {
-                                reply.error(ENOENT);
+                                reply.error(Errno::ENOENT);
                                 return;
                             }
                         }
@@ -207,23 +212,24 @@ impl Filesystem for Pqfs {
                     PqfsInner::do_read(crypto.as_ref(), &entry, data_path, offset, size, reply);
                 });
             }
-            Some(_) => reply.error(EISDIR),
-            None => reply.error(ENOENT),
+            Some(_) => reply.error(Errno::EISDIR),
+            None => reply.error(Errno::ENOENT),
         }
     }
 
     fn write(
-        &mut self,
-        _req: &Request<'_>,
-        ino: u64,
-        _fh: u64,
-        offset: i64,
+        &self,
+        _req: &Request,
+        ino: INodeNo,
+        _fh: FileHandle,
+        offset: u64,
         data: &[u8],
-        _write_flags: u32,
-        _flags: i32,
-        _lock_owner: Option<u64>,
+        _write_flags: WriteFlags,
+        _flags: OpenFlags,
+        _lock_owner: Option<LockOwner>,
         reply: ReplyWrite,
     ) {
+        let ino = ino.0;
         let data = data.to_vec();
         let inner = Arc::clone(&self.inner);
         let crypto = Arc::clone(&self.crypto);
@@ -246,7 +252,7 @@ impl Filesystem for Pqfs {
                         match inner.entries.get(&ino) {
                             Some(entry) => entry.clone(),
                             None => {
-                                reply.error(ENOENT);
+                                reply.error(Errno::ENOENT);
                                 return;
                             }
                         }
@@ -261,7 +267,7 @@ impl Filesystem for Pqfs {
                     ) {
                         Ok(v) => v,
                         Err(code) => {
-                            reply.error(code);
+                            reply.error(Errno::from_i32(code));
                             return;
                         }
                     };
@@ -270,17 +276,17 @@ impl Filesystem for Pqfs {
                     inner.commit_write(ino, content_key_enc, size, reply, written);
                 });
             }
-            Some(EntryKind::Dir) => reply.error(EISDIR),
-            Some(EntryKind::Symlink) => reply.error(EINVAL),
-            None => reply.error(ENOENT),
+            Some(EntryKind::Dir) => reply.error(Errno::EISDIR),
+            Some(EntryKind::Symlink) => reply.error(Errno::EINVAL),
+            None => reply.error(Errno::ENOENT),
         }
     }
 
     #[allow(clippy::too_many_arguments)]
     fn setattr(
-        &mut self,
-        _req: &Request<'_>,
-        ino: u64,
+        &self,
+        _req: &Request,
+        ino: INodeNo,
         mode: Option<u32>,
         uid: Option<u32>,
         gid: Option<u32>,
@@ -288,13 +294,15 @@ impl Filesystem for Pqfs {
         atime: Option<TimeOrNow>,
         mtime: Option<TimeOrNow>,
         _ctime: Option<SystemTime>,
-        _fh: Option<u64>,
+        _fh: Option<FileHandle>,
         _crtime: Option<SystemTime>,
         _chgtime: Option<SystemTime>,
         _bkuptime: Option<SystemTime>,
-        _flags: Option<u32>,
+        _flags: Option<BsdFileFlags>,
+        _kill_suid_gid: bool,
         reply: ReplyAttr,
     ) {
+        let ino = ino.0;
         let inner = Arc::clone(&self.inner);
         let crypto = Arc::clone(&self.crypto);
         let lock = self.inode_lock(ino);
@@ -305,7 +313,7 @@ impl Filesystem for Pqfs {
         };
 
         let Some(entry) = entry else {
-            reply.error(ENOENT);
+            reply.error(Errno::ENOENT);
             return;
         };
 
@@ -325,7 +333,7 @@ impl Filesystem for Pqfs {
         };
 
         if !matches!(entry.kind, EntryKind::File) {
-            reply.error(EISDIR);
+            reply.error(Errno::EISDIR);
             return;
         }
 
@@ -337,7 +345,7 @@ impl Filesystem for Pqfs {
                 match guard.entries.get(&ino) {
                     Some(entry) => entry.clone(),
                     None => {
-                        reply.error(ENOENT);
+                        reply.error(Errno::ENOENT);
                         return;
                     }
                 }
@@ -346,7 +354,7 @@ impl Filesystem for Pqfs {
             let truncated = match PqfsInner::do_truncate(crypto.as_ref(), &entry, data_path, size) {
                 Ok(v) => v,
                 Err(code) => {
-                    reply.error(code);
+                    reply.error(Errno::from_i32(code));
                     return;
                 }
             };
@@ -367,105 +375,125 @@ impl Filesystem for Pqfs {
     }
 
     fn rename(
-        &mut self,
-        _req: &Request<'_>,
-        parent: u64,
+        &self,
+        _req: &Request,
+        parent: INodeNo,
         name: &OsStr,
-        newparent: u64,
+        newparent: INodeNo,
         newname: &OsStr,
-        flags: u32,
+        flags: RenameFlags,
+        _owner: Option<Owner>,
         reply: ReplyEmpty,
     ) {
         let crypto = Arc::clone(&self.crypto);
         self.write_inner().rename(
             crypto.as_ref(),
-            parent,
+            parent.0,
             name,
-            newparent,
+            newparent.0,
             newname,
-            flags,
+            flags.bits(),
             reply,
         );
     }
 
     fn readdir(
-        &mut self,
-        _req: &Request<'_>,
-        ino: u64,
-        _fh: u64,
-        offset: i64,
+        &self,
+        _req: &Request,
+        ino: INodeNo,
+        _fh: FileHandle,
+        offset: u64,
         reply: ReplyDirectory,
     ) {
+        let ino = ino.0;
         let crypto = self.crypto.as_ref();
         self.read_inner().readdir(crypto, ino, offset, reply);
     }
 
     fn create(
-        &mut self,
-        _req: &Request<'_>,
-        parent: u64,
+        &self,
+        _req: &Request,
+        parent: INodeNo,
         name: &OsStr,
         mode: u32,
         _umask: u32,
         _flags: i32,
+        _kill_suid_gid: bool,
+        _owner: Owner,
         reply: ReplyCreate,
     ) {
+        let parent = parent.0;
         let crypto = self.crypto.as_ref();
         self.write_inner().create(crypto, parent, name, mode, reply);
     }
 
     fn mkdir(
-        &mut self,
-        _req: &Request<'_>,
-        parent: u64,
+        &self,
+        _req: &Request,
+        parent: INodeNo,
         name: &OsStr,
         mode: u32,
         _umask: u32,
+        _owner: Owner,
         reply: ReplyEntry,
     ) {
+        let parent = parent.0;
         let crypto = self.crypto.as_ref();
         self.write_inner().mkdir(crypto, parent, name, mode, reply);
     }
 
-    fn unlink(&mut self, _req: &Request<'_>, parent: u64, name: &OsStr, reply: ReplyEmpty) {
+    fn unlink(&self, _req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEmpty) {
+        let parent = parent.0;
         let crypto = self.crypto.as_ref();
         self.write_inner().unlink(crypto, parent, name, reply);
     }
 
-    fn rmdir(&mut self, _req: &Request<'_>, parent: u64, name: &OsStr, reply: ReplyEmpty) {
+    fn rmdir(&self, _req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEmpty) {
+        let parent = parent.0;
         let crypto = self.crypto.as_ref();
         self.write_inner().rmdir(crypto, parent, name, reply);
     }
 
-    fn open(&mut self, _req: &Request<'_>, ino: u64, _flags: i32, reply: ReplyOpen) {
+    fn open(
+        &self,
+        _req: &Request,
+        ino: INodeNo,
+        _flags: OpenFlags,
+        _kill_suid_gid: bool,
+        reply: ReplyOpen,
+    ) {
+        let ino = ino.0;
         self.read_inner().open(ino, reply);
     }
 
     fn symlink(
-        &mut self,
-        _req: &Request<'_>,
-        parent: u64,
+        &self,
+        _req: &Request,
+        parent: INodeNo,
         link_name: &OsStr,
         target: &Path,
+        _owner: Owner,
         reply: ReplyEntry,
     ) {
+        let parent = parent.0;
         let crypto = Arc::clone(&self.crypto);
         self.write_inner()
             .symlink(crypto.as_ref(), parent, link_name, target, reply);
     }
 
-    fn readlink(&mut self, _req: &Request<'_>, ino: u64, reply: ReplyData) {
+    fn readlink(&self, _req: &Request, ino: INodeNo, reply: ReplyData) {
+        let ino = ino.0;
         let crypto = Arc::clone(&self.crypto);
         self.read_inner().readlink(crypto.as_ref(), ino, reply);
     }
 
-    fn statfs(&mut self, _req: &Request<'_>, _ino: u64, reply: ReplyStatfs) {
+    fn statfs(&self, _req: &Request, _ino: INodeNo, reply: ReplyStatfs) {
         let inner = self.read_inner();
         let stats = match backing_store_stats(&inner.backend) {
             Ok(stats) => stats,
             Err(e) => {
                 error!("statfs error: {}", e);
-                reply.error(EIO);
+                reply.error(Errno::EIO);
                 return;
             }
         };
@@ -482,13 +510,14 @@ impl Filesystem for Pqfs {
     }
 
     fn fsync(
-        &mut self,
-        _req: &Request<'_>,
-        ino: u64,
-        _fh: u64,
+        &self,
+        _req: &Request,
+        ino: INodeNo,
+        _fh: FileHandle,
         _datasync: bool,
         reply: ReplyEmpty,
     ) {
+        let ino = ino.0;
         let crypto = Arc::clone(&self.crypto);
         let lock = self.inode_lock(ino);
         let _guard = lock.read().unwrap_or_else(|e| e.into_inner());
@@ -496,42 +525,43 @@ impl Filesystem for Pqfs {
         let mut inner = self.write_inner();
         if let Err(e) = blocks::sync(&inner.data_path(ino)) {
             error!("fsync error for inode {}: {}", ino, e);
-            reply.error(EIO);
+            reply.error(Errno::EIO);
             return;
         }
         if let Err(e) = inner.flush_index(crypto.as_ref()) {
             error!("index save error: {}", e);
-            reply.error(EIO);
+            reply.error(Errno::EIO);
             return;
         }
         reply.ok();
     }
 
     fn fsyncdir(
-        &mut self,
-        _req: &Request<'_>,
-        _ino: u64,
-        _fh: u64,
+        &self,
+        _req: &Request,
+        _ino: INodeNo,
+        _fh: FileHandle,
         _datasync: bool,
         reply: ReplyEmpty,
     ) {
         let crypto = Arc::clone(&self.crypto);
         if let Err(e) = self.write_inner().flush_index(crypto.as_ref()) {
             error!("index save error: {}", e);
-            reply.error(EIO);
+            reply.error(Errno::EIO);
             return;
         }
         reply.ok();
     }
 
     fn flush(
-        &mut self,
-        _req: &Request<'_>,
-        ino: u64,
-        _fh: u64,
-        _lock_owner: u64,
+        &self,
+        _req: &Request,
+        ino: INodeNo,
+        _fh: FileHandle,
+        _lock_owner: LockOwner,
         reply: ReplyEmpty,
     ) {
+        let ino = ino.0;
         let crypto = Arc::clone(&self.crypto);
         let lock = self.inode_lock(ino);
         let _guard = lock.read().unwrap_or_else(|e| e.into_inner());
@@ -539,24 +569,24 @@ impl Filesystem for Pqfs {
         let mut inner = self.write_inner();
         if let Err(e) = blocks::sync(&inner.data_path(ino)) {
             error!("flush error for inode {}: {}", ino, e);
-            reply.error(EIO);
+            reply.error(Errno::EIO);
             return;
         }
         if let Err(e) = inner.flush_index(crypto.as_ref()) {
             error!("index save error: {}", e);
-            reply.error(EIO);
+            reply.error(Errno::EIO);
             return;
         }
         reply.ok();
     }
 
     fn release(
-        &mut self,
-        _req: &Request<'_>,
-        _ino: u64,
-        _fh: u64,
-        _flags: i32,
-        _lock_owner: Option<u64>,
+        &self,
+        _req: &Request,
+        _ino: INodeNo,
+        _fh: FileHandle,
+        _flags: OpenFlags,
+        _lock_owner: Option<LockOwner>,
         _flush: bool,
         reply: ReplyEmpty,
     ) {

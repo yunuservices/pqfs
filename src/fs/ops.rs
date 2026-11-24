@@ -3,25 +3,25 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use fuser::{
-    FUSE_ROOT_ID, FileType, ReplyAttr, ReplyCreate, ReplyData, ReplyDirectory, ReplyEmpty,
-    ReplyEntry, ReplyOpen, ReplyWrite, TimeOrNow,
+    Errno, FileHandle, FileType, FopenFlags, Generation, INodeNo, ReplyAttr, ReplyCreate,
+    ReplyData, ReplyDirectory, ReplyEmpty, ReplyEntry, ReplyOpen, ReplyWrite, TimeOrNow,
 };
-use libc::{EEXIST, EINVAL, EIO, EISDIR, ENOENT, ENOTDIR, ENOTEMPTY};
+use libc::{EEXIST, EINVAL, EIO};
 use tracing::{error, warn};
 use zeroize::Zeroizing;
 
-use super::TTL;
 use super::blocks;
 use super::entry::{Entry, EntryKind, Timestamps, file_type};
 use super::inner::PqfsInner;
+use super::{ROOT_INO, TTL};
 use crate::crypto::Crypto;
 
 impl PqfsInner {
     pub(crate) fn lookup(&self, crypto: &Crypto, parent: u64, name: &OsStr, reply: ReplyEntry) {
         if let Some(entry) = self.find_child(crypto, parent, name).cloned() {
-            reply.entry(&TTL, &self.attr_for(&entry), 0);
+            reply.entry(&TTL, &self.attr_for(&entry), Generation(0));
         } else {
-            reply.error(ENOENT);
+            reply.error(Errno::ENOENT);
         }
     }
 
@@ -29,7 +29,7 @@ impl PqfsInner {
         if let Some(entry) = self.entries.get(&ino).cloned() {
             reply.attr(&TTL, &self.attr_for(&entry));
         } else {
-            reply.error(ENOENT);
+            reply.error(Errno::ENOENT);
         }
     }
 
@@ -40,7 +40,7 @@ impl PqfsInner {
         crypto: &Crypto,
         entry: &Entry,
         data_path: PathBuf,
-        offset: i64,
+        offset: u64,
         size: u32,
         reply: ReplyData,
     ) {
@@ -52,12 +52,11 @@ impl PqfsInner {
         let content_key = match decrypt_content_key(crypto, &entry.content_key, entry.ino) {
             Ok(v) => v,
             Err(code) => {
-                reply.error(code);
+                reply.error(Errno::from_i32(code));
                 return;
             }
         };
 
-        let offset = u64::try_from(offset).unwrap_or(0);
         match blocks::read_range(
             crypto,
             content_key.as_slice(),
@@ -69,7 +68,7 @@ impl PqfsInner {
             Ok(data) => reply.data(&data),
             Err(e) => {
                 error!("read error for inode {}: {}", entry.ino, e);
-                reply.error(EIO);
+                reply.error(Errno::EIO);
             }
         }
     }
@@ -78,12 +77,11 @@ impl PqfsInner {
         crypto: &Crypto,
         entry: &Entry,
         data_path: PathBuf,
-        offset: i64,
+        offset: u64,
         data: &[u8],
     ) -> Result<(Vec<u8>, u64), i32> {
         let content_key_enc = ensure_content_key(crypto, entry)?;
         let content_key = decrypt_content_key(crypto, &content_key_enc, entry.ino)?;
-        let offset = u64::try_from(offset).unwrap_or(0);
 
         match blocks::write_range(
             crypto,
@@ -123,15 +121,15 @@ impl PqfsInner {
         &self,
         crypto: &Crypto,
         ino: u64,
-        offset: i64,
+        offset: u64,
         mut reply: ReplyDirectory,
     ) {
         let Some(parent) = self.entries.get(&ino).cloned() else {
-            reply.error(ENOENT);
+            reply.error(Errno::ENOENT);
             return;
         };
         if !matches!(parent.kind, EntryKind::Dir) {
-            reply.error(ENOTDIR);
+            reply.error(Errno::ENOTDIR);
             return;
         }
 
@@ -144,7 +142,7 @@ impl PqfsInner {
                 Ok(n) => n,
                 Err(e) => {
                     error!("filename decryption error for inode {}: {}", child.ino, e);
-                    reply.error(EIO);
+                    reply.error(Errno::EIO);
                     return;
                 }
             };
@@ -152,7 +150,7 @@ impl PqfsInner {
         }
 
         for (i, (ino, kind, name)) in entries.into_iter().enumerate().skip(offset as usize) {
-            if reply.add(ino, (i + 1) as i64, kind, &name) {
+            if reply.add(INodeNo(ino), (i + 1) as u64, kind, &name) {
                 break;
             }
         }
@@ -168,7 +166,7 @@ impl PqfsInner {
         reply: ReplyCreate,
     ) {
         if self.find_child(crypto, parent, name).is_some() {
-            reply.error(EEXIST);
+            reply.error(Errno::EEXIST);
             return;
         }
 
@@ -179,7 +177,7 @@ impl PqfsInner {
             Ok(v) => v,
             Err(e) => {
                 error!("filename encryption error: {}", e);
-                reply.error(EIO);
+                reply.error(Errno::EIO);
                 return;
             }
         };
@@ -187,7 +185,7 @@ impl PqfsInner {
             Ok(v) => v,
             Err(e) => {
                 error!("content key encryption error: {}", e);
-                reply.error(EIO);
+                reply.error(Errno::EIO);
                 return;
             }
         };
@@ -209,11 +207,17 @@ impl PqfsInner {
         self.insert_entry(entry.clone());
         if let Err(e) = self.save_index(crypto) {
             error!("index save error: {}", e);
-            reply.error(EIO);
+            reply.error(Errno::EIO);
             return;
         }
 
-        reply.created(&TTL, &self.attr_for(&entry), 0, 0, 0);
+        reply.created(
+            &TTL,
+            &self.attr_for(&entry),
+            Generation(0),
+            FileHandle(0),
+            FopenFlags::empty(),
+        );
     }
 
     pub(crate) fn mkdir(
@@ -225,7 +229,7 @@ impl PqfsInner {
         reply: ReplyEntry,
     ) {
         if self.find_child(crypto, parent, name).is_some() {
-            reply.error(EEXIST);
+            reply.error(Errno::EEXIST);
             return;
         }
 
@@ -236,7 +240,7 @@ impl PqfsInner {
             Ok(v) => v,
             Err(e) => {
                 error!("filename encryption error: {}", e);
-                reply.error(EIO);
+                reply.error(Errno::EIO);
                 return;
             }
         };
@@ -258,11 +262,11 @@ impl PqfsInner {
         self.insert_entry(entry.clone());
         if let Err(e) = self.save_index(crypto) {
             error!("index save error: {}", e);
-            reply.error(EIO);
+            reply.error(Errno::EIO);
             return;
         }
 
-        reply.entry(&TTL, &self.attr_for(&entry), 0);
+        reply.entry(&TTL, &self.attr_for(&entry), Generation(0));
     }
 
     pub(crate) fn symlink(
@@ -274,7 +278,7 @@ impl PqfsInner {
         reply: ReplyEntry,
     ) {
         if self.find_child(crypto, parent, name).is_some() {
-            reply.error(EEXIST);
+            reply.error(Errno::EEXIST);
             return;
         }
 
@@ -283,7 +287,7 @@ impl PqfsInner {
             Ok(v) => v,
             Err(e) => {
                 error!("link target encryption error: {}", e);
-                reply.error(EIO);
+                reply.error(Errno::EIO);
                 return;
             }
         };
@@ -295,7 +299,7 @@ impl PqfsInner {
             Ok(v) => v,
             Err(e) => {
                 error!("filename encryption error: {}", e);
-                reply.error(EIO);
+                reply.error(Errno::EIO);
                 return;
             }
         };
@@ -318,39 +322,39 @@ impl PqfsInner {
         self.insert_entry(entry.clone());
         if let Err(e) = self.save_index(crypto) {
             error!("index save error: {}", e);
-            reply.error(EIO);
+            reply.error(Errno::EIO);
             return;
         }
 
-        reply.entry(&TTL, &self.attr_for(&entry), 0);
+        reply.entry(&TTL, &self.attr_for(&entry), Generation(0));
     }
 
     pub(crate) fn readlink(&self, crypto: &Crypto, ino: u64, reply: ReplyData) {
         let Some(entry) = self.entries.get(&ino) else {
-            reply.error(ENOENT);
+            reply.error(Errno::ENOENT);
             return;
         };
         if !matches!(entry.kind, EntryKind::Symlink) {
-            reply.error(EINVAL);
+            reply.error(Errno::EINVAL);
             return;
         }
         match crypto.decrypt_filename(&entry.link_target) {
             Ok(target) => reply.data(target.as_bytes()),
             Err(e) => {
                 error!("link target decryption error for inode {}: {}", ino, e);
-                reply.error(EIO);
+                reply.error(Errno::EIO);
             }
         }
     }
 
     pub(crate) fn unlink(&mut self, crypto: &Crypto, parent: u64, name: &OsStr, reply: ReplyEmpty) {
         let Some(entry) = self.find_child(crypto, parent, name).cloned() else {
-            reply.error(ENOENT);
+            reply.error(Errno::ENOENT);
             return;
         };
 
         if matches!(entry.kind, EntryKind::Dir) {
-            reply.error(EISDIR);
+            reply.error(Errno::EISDIR);
             return;
         }
 
@@ -363,7 +367,7 @@ impl PqfsInner {
         }
         if let Err(e) = self.save_index(crypto) {
             error!("index save error: {}", e);
-            reply.error(EIO);
+            reply.error(Errno::EIO);
             return;
         }
         reply.ok();
@@ -371,22 +375,22 @@ impl PqfsInner {
 
     pub(crate) fn rmdir(&mut self, crypto: &Crypto, parent: u64, name: &OsStr, reply: ReplyEmpty) {
         let Some(entry) = self.find_child(crypto, parent, name).cloned() else {
-            reply.error(ENOENT);
+            reply.error(Errno::ENOENT);
             return;
         };
         if !matches!(entry.kind, EntryKind::Dir) {
-            reply.error(ENOTDIR);
+            reply.error(Errno::ENOTDIR);
             return;
         }
         if self.has_children(entry.ino) {
-            reply.error(ENOTEMPTY);
+            reply.error(Errno::ENOTEMPTY);
             return;
         }
 
         self.remove_entry(entry.ino);
         if let Err(e) = self.save_index(crypto) {
             error!("index save error: {}", e);
-            reply.error(EIO);
+            reply.error(Errno::EIO);
             return;
         }
         reply.ok();
@@ -406,7 +410,7 @@ impl PqfsInner {
         reply: ReplyAttr,
     ) {
         let Some(entry) = self.entries.get_mut(&ino) else {
-            reply.error(ENOENT);
+            reply.error(Errno::ENOENT);
             return;
         };
 
@@ -435,7 +439,7 @@ impl PqfsInner {
         let entry = entry.clone();
         if let Err(e) = self.save_index(crypto) {
             error!("index save error: {}", e);
-            reply.error(EIO);
+            reply.error(Errno::EIO);
             return;
         }
         reply.attr(&TTL, &self.attr_for(&entry));
@@ -443,7 +447,7 @@ impl PqfsInner {
 
     pub(crate) fn is_descendant_of(&self, mut ino: u64, ancestor: u64) -> bool {
         let mut hops = 0;
-        while ino != FUSE_ROOT_ID && hops < self.entries.len() + 1 {
+        while ino != ROOT_INO && hops < self.entries.len() + 1 {
             if ino == ancestor {
                 return true;
             }
@@ -468,30 +472,30 @@ impl PqfsInner {
         reply: ReplyEmpty,
     ) {
         let Some(source) = self.find_child(crypto, parent, name).cloned() else {
-            reply.error(ENOENT);
+            reply.error(Errno::ENOENT);
             return;
         };
 
         let target_exists = self.find_child(crypto, newparent, newname).is_some();
         if let Some(code) = rename_flags_error(flags, target_exists) {
-            reply.error(code);
+            reply.error(Errno::from_i32(code));
             return;
         }
 
         match self.entries.get(&newparent) {
             Some(entry) if matches!(entry.kind, EntryKind::Dir) => {}
             Some(_) => {
-                reply.error(ENOTDIR);
+                reply.error(Errno::ENOTDIR);
                 return;
             }
             None => {
-                reply.error(ENOENT);
+                reply.error(Errno::ENOENT);
                 return;
             }
         }
 
         if matches!(source.kind, EntryKind::Dir) && self.is_descendant_of(newparent, source.ino) {
-            reply.error(EINVAL);
+            reply.error(Errno::EINVAL);
             return;
         }
 
@@ -504,16 +508,16 @@ impl PqfsInner {
             ) {
                 (true, true) => {
                     if self.has_children(existing.ino) {
-                        reply.error(ENOTEMPTY);
+                        reply.error(Errno::ENOTEMPTY);
                         return;
                     }
                 }
                 (true, false) => {
-                    reply.error(ENOTDIR);
+                    reply.error(Errno::ENOTDIR);
                     return;
                 }
                 (false, true) => {
-                    reply.error(EISDIR);
+                    reply.error(Errno::EISDIR);
                     return;
                 }
                 (false, false) => {}
@@ -534,7 +538,7 @@ impl PqfsInner {
             Ok(v) => v,
             Err(e) => {
                 error!("filename encryption error: {}", e);
-                reply.error(EIO);
+                reply.error(Errno::EIO);
                 return;
             }
         };
@@ -543,7 +547,7 @@ impl PqfsInner {
 
         if let Err(e) = self.save_index(crypto) {
             error!("index save error: {}", e);
-            reply.error(EIO);
+            reply.error(Errno::EIO);
             return;
         }
         reply.ok();
@@ -551,9 +555,9 @@ impl PqfsInner {
 
     pub(crate) fn open(&self, ino: u64, reply: ReplyOpen) {
         if self.entries.contains_key(&ino) {
-            reply.opened(0, 0);
+            reply.opened(FileHandle(0), FopenFlags::empty());
         } else {
-            reply.error(ENOENT);
+            reply.error(Errno::ENOENT);
         }
     }
 
@@ -675,7 +679,7 @@ mod tests {
             let inner = Arc::new(RwLock::new(inner));
             let lock = Arc::new(RwLock::new(()));
 
-            let handles: Vec<_> = [(0i64, b'A'), (4096i64, b'B')]
+            let handles: Vec<_> = [(0u64, b'A'), (4096u64, b'B')]
                 .into_iter()
                 .map(|(offset, byte)| {
                     let inner = Arc::clone(&inner);
@@ -749,13 +753,13 @@ mod tests {
         let crypto = Crypto::init_for_tests("pw", dir.path()).unwrap();
         let inner = PqfsInner::load(dir.path().to_path_buf(), &crypto).unwrap();
 
-        let root = inner.entries.get(&fuser::FUSE_ROOT_ID).unwrap();
-        assert_eq!(root.parent, fuser::FUSE_ROOT_ID);
+        let root = inner.entries.get(&ROOT_INO).unwrap();
+        assert_eq!(root.parent, ROOT_INO);
 
         let children: Vec<_> = inner
             .entries
             .values()
-            .filter(|e| e.parent == fuser::FUSE_ROOT_ID && e.ino != fuser::FUSE_ROOT_ID)
+            .filter(|e| e.parent == ROOT_INO && e.ino != ROOT_INO)
             .collect();
         assert!(children.is_empty());
     }

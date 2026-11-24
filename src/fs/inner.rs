@@ -5,10 +5,10 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
-use fuser::{FUSE_ROOT_ID, FileAttr};
+use fuser::{FileAttr, INodeNo};
 
 use super::entry::{Entry, EntryKind, Timestamps, file_type, to_system_time};
-use super::{BLOCK_SIZE, INDEX_FILE};
+use super::{BLOCK_SIZE, INDEX_FILE, ROOT_INO};
 use crate::crypto::Crypto;
 
 /// The actual filesystem metadata state. It is decoupled from `Crypto` so
@@ -35,7 +35,7 @@ impl PqfsInner {
                 "failed to decrypt index (the volume may have been rekeyed since this header was written)",
             )?;
             let map: BTreeMap<u64, Entry> = bincode::deserialize(&plaintext)?;
-            let next_ino = map.keys().next_back().copied().unwrap_or(FUSE_ROOT_ID) + 1;
+            let next_ino = map.keys().next_back().copied().unwrap_or(ROOT_INO) + 1;
             (map, next_ino)
         } else {
             let mut map = BTreeMap::new();
@@ -44,10 +44,10 @@ impl PqfsInner {
                 .encrypt_filename("")
                 .context("failed to encrypt root name")?;
             map.insert(
-                FUSE_ROOT_ID,
+                ROOT_INO,
                 Entry {
-                    ino: FUSE_ROOT_ID,
-                    parent: FUSE_ROOT_ID,
+                    ino: ROOT_INO,
+                    parent: ROOT_INO,
                     name_hash: root_hash,
                     name_encrypted: root_name,
                     content_key: Vec::new(),
@@ -60,7 +60,7 @@ impl PqfsInner {
                     link_target: Vec::new(),
                 },
             );
-            (map, FUSE_ROOT_ID + 1)
+            (map, ROOT_INO + 1)
         };
 
         let mut this = Self {
@@ -81,7 +81,7 @@ impl PqfsInner {
         let links: Vec<(u64, u64, [u8; 32])> = self
             .entries
             .values()
-            .filter(|e| e.ino != FUSE_ROOT_ID)
+            .filter(|e| e.ino != ROOT_INO)
             .map(|e| (e.ino, e.parent, e.name_hash))
             .collect();
         for (ino, parent, name_hash) in links {
@@ -111,7 +111,7 @@ impl PqfsInner {
             let (parent, name_hash) = (previous.parent, previous.name_hash);
             self.unlink_index(entry.ino, parent, name_hash);
         }
-        if entry.ino != FUSE_ROOT_ID {
+        if entry.ino != ROOT_INO {
             self.link(entry.ino, entry.parent, entry.name_hash);
         }
         self.entries.insert(entry.ino, entry);
@@ -188,7 +188,7 @@ impl PqfsInner {
 
     pub(crate) fn attr_for(&self, entry: &Entry) -> FileAttr {
         FileAttr {
-            ino: entry.ino,
+            ino: INodeNo(entry.ino),
             size: entry.size,
             blocks: entry.size.div_ceil(BLOCK_SIZE),
             atime: to_system_time(entry.times.atime),
@@ -284,8 +284,8 @@ mod tests {
     fn load_creates_root_entry() {
         let (dir, crypto) = setup();
         let inner = PqfsInner::load(dir.path().to_path_buf(), &crypto).unwrap();
-        assert!(inner.entries.contains_key(&FUSE_ROOT_ID));
-        assert_eq!(inner.next_ino, FUSE_ROOT_ID + 1);
+        assert!(inner.entries.contains_key(&ROOT_INO));
+        assert_eq!(inner.next_ino, ROOT_INO + 1);
     }
 
     #[test]
@@ -311,11 +311,11 @@ mod tests {
         let (dir, crypto) = setup();
         let mut inner = PqfsInner::load(dir.path().to_path_buf(), &crypto).unwrap();
         let first = inner.allocate_ino();
-        assert_eq!(first, FUSE_ROOT_ID + 1);
+        assert_eq!(first, ROOT_INO + 1);
 
         inner.insert_entry(Entry {
             ino: first,
-            parent: FUSE_ROOT_ID,
+            parent: ROOT_INO,
             name_hash: [0u8; 32],
             name_encrypted: Vec::new(),
             content_key: Vec::new(),
@@ -330,7 +330,7 @@ mod tests {
 
         inner.save_index(&crypto).unwrap();
         let reloaded = PqfsInner::load(dir.path().to_path_buf(), &crypto).unwrap();
-        assert!(reloaded.entries.contains_key(&FUSE_ROOT_ID));
+        assert!(reloaded.entries.contains_key(&ROOT_INO));
         assert!(reloaded.entries.contains_key(&first));
         assert_eq!(reloaded.next_ino, inner.next_ino);
     }
@@ -345,7 +345,7 @@ mod tests {
         times.crtime = 1_600_000_000_000_000_000;
         inner.insert_entry(Entry {
             ino,
-            parent: FUSE_ROOT_ID,
+            parent: ROOT_INO,
             name_hash: [0u8; 32],
             name_encrypted: Vec::new(),
             content_key: Vec::new(),
@@ -368,11 +368,11 @@ mod tests {
     fn timestamps_survive_an_index_reload() {
         let (dir, crypto) = setup();
         let mut inner = PqfsInner::load(dir.path().to_path_buf(), &crypto).unwrap();
-        let before = inner.entries.get(&FUSE_ROOT_ID).unwrap().times;
+        let before = inner.entries.get(&ROOT_INO).unwrap().times;
         inner.save_index(&crypto).unwrap();
 
         let reloaded = PqfsInner::load(dir.path().to_path_buf(), &crypto).unwrap();
-        let after = reloaded.entries.get(&FUSE_ROOT_ID).unwrap().times;
+        let after = reloaded.entries.get(&ROOT_INO).unwrap().times;
         assert_eq!(before.crtime, after.crtime);
         assert_eq!(before.mtime, after.mtime);
     }
@@ -384,7 +384,7 @@ mod tests {
 
         let a = inner.allocate_ino();
         let b = inner.allocate_ino();
-        for (ino, parent) in [(a, FUSE_ROOT_ID), (b, a)] {
+        for (ino, parent) in [(a, ROOT_INO), (b, a)] {
             inner.insert_entry(Entry {
                 ino,
                 parent,
@@ -403,7 +403,7 @@ mod tests {
 
         assert!(inner.is_descendant_of(b, a));
         assert!(!inner.is_descendant_of(a, b));
-        assert!(!inner.is_descendant_of(FUSE_ROOT_ID, a));
+        assert!(!inner.is_descendant_of(ROOT_INO, a));
     }
 
     #[test]
@@ -415,7 +415,7 @@ mod tests {
         let name = "belge.txt";
         inner.insert_entry(Entry {
             ino,
-            parent: FUSE_ROOT_ID,
+            parent: ROOT_INO,
             name_hash: crypto.hash_filename(name),
             name_encrypted: crypto.encrypt_filename(name).unwrap(),
             content_key: Vec::new(),
@@ -431,11 +431,11 @@ mod tests {
 
         let reloaded = PqfsInner::load(dir.path().to_path_buf(), &crypto).unwrap();
         let found = reloaded
-            .find_child(&crypto, FUSE_ROOT_ID, std::ffi::OsStr::new(name))
+            .find_child(&crypto, ROOT_INO, std::ffi::OsStr::new(name))
             .unwrap();
         assert_eq!(found.ino, ino);
-        assert_eq!(reloaded.child_inodes(FUSE_ROOT_ID).count(), 1);
-        assert!(reloaded.has_children(FUSE_ROOT_ID));
+        assert_eq!(reloaded.child_inodes(ROOT_INO).count(), 1);
+        assert!(reloaded.has_children(ROOT_INO));
         assert!(!reloaded.has_children(ino));
     }
 
@@ -447,7 +447,7 @@ mod tests {
         let target_dir = inner.allocate_ino();
         inner.insert_entry(Entry {
             ino: target_dir,
-            parent: FUSE_ROOT_ID,
+            parent: ROOT_INO,
             name_hash: crypto.hash_filename("d"),
             name_encrypted: crypto.encrypt_filename("d").unwrap(),
             content_key: Vec::new(),
@@ -463,7 +463,7 @@ mod tests {
         let ino = inner.allocate_ino();
         inner.insert_entry(Entry {
             ino,
-            parent: FUSE_ROOT_ID,
+            parent: ROOT_INO,
             name_hash: crypto.hash_filename("eski"),
             name_encrypted: crypto.encrypt_filename("eski").unwrap(),
             content_key: Vec::new(),
@@ -485,7 +485,7 @@ mod tests {
 
         assert!(
             inner
-                .find_child(&crypto, FUSE_ROOT_ID, std::ffi::OsStr::new("eski"))
+                .find_child(&crypto, ROOT_INO, std::ffi::OsStr::new("eski"))
                 .is_none()
         );
         let moved = inner
@@ -503,7 +503,7 @@ mod tests {
         let ino = inner.allocate_ino();
         inner.insert_entry(Entry {
             ino,
-            parent: FUSE_ROOT_ID,
+            parent: ROOT_INO,
             name_hash: crypto.hash_filename("x"),
             name_encrypted: crypto.encrypt_filename("x").unwrap(),
             content_key: Vec::new(),
@@ -515,13 +515,13 @@ mod tests {
             times: Timestamps::now(),
             link_target: Vec::new(),
         });
-        assert!(inner.has_children(FUSE_ROOT_ID));
+        assert!(inner.has_children(ROOT_INO));
 
         inner.remove_entry(ino).unwrap();
-        assert!(!inner.has_children(FUSE_ROOT_ID));
+        assert!(!inner.has_children(ROOT_INO));
         assert!(
             inner
-                .find_child(&crypto, FUSE_ROOT_ID, std::ffi::OsStr::new("x"))
+                .find_child(&crypto, ROOT_INO, std::ffi::OsStr::new("x"))
                 .is_none()
         );
     }
@@ -554,7 +554,7 @@ mod tests {
         let file = inner.allocate_ino();
         inner.insert_entry(Entry {
             ino: file,
-            parent: FUSE_ROOT_ID,
+            parent: ROOT_INO,
             name_hash: old.hash_filename("belge.txt"),
             name_encrypted: old.encrypt_filename("belge.txt").unwrap(),
             content_key: old.encrypt(old.random_key().as_slice()).unwrap(),
@@ -570,7 +570,7 @@ mod tests {
         let link = inner.allocate_ino();
         inner.insert_entry(Entry {
             ino: link,
-            parent: FUSE_ROOT_ID,
+            parent: ROOT_INO,
             name_hash: old.hash_filename("link"),
             name_encrypted: old.encrypt_filename("link").unwrap(),
             content_key: Vec::new(),
@@ -598,7 +598,7 @@ mod tests {
         );
         assert!(
             reloaded
-                .find_child(&new, FUSE_ROOT_ID, std::ffi::OsStr::new("belge.txt"))
+                .find_child(&new, ROOT_INO, std::ffi::OsStr::new("belge.txt"))
                 .is_some()
         );
 
