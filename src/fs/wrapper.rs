@@ -581,6 +581,7 @@ fn mount_config(options: &[String]) -> Config {
         MountOption::FSName("pqfs".to_string()),
         MountOption::Subtype("pqfs".to_string()),
         MountOption::NoAtime,
+        MountOption::DefaultPermissions,
     ];
 
     if options.iter().any(|o| o == "ro") {
@@ -647,6 +648,15 @@ mod tests {
         assert_eq!(
             mount_config(&options(&["allow_root"])).acl,
             SessionACL::RootAndOwner
+        );
+    }
+
+    #[test]
+    fn the_kernel_enforces_permissions() {
+        assert!(
+            mount_config(&[])
+                .mount_options
+                .contains(&MountOption::DefaultPermissions)
         );
     }
 
