@@ -130,13 +130,12 @@ pub(crate) fn derive_filename_keys(master_key: &[u8]) -> Result<(SecretKey, Secr
 }
 
 impl Crypto {
-    pub(crate) fn from_master_key(master_key: &[u8], header: VolumeHeader) -> Result<Self> {
+    pub(crate) fn from_master_key(master_key: &[u8]) -> Result<Self> {
         let (filename_key, filename_hash_key) = derive_filename_keys(master_key)?;
         let cipher = build_cipher(master_key)?;
         let filename_cipher = build_cipher(filename_key.as_slice())?;
         Ok(Self {
             cipher,
-            header,
             filename_cipher,
             filename_hash_key,
         })

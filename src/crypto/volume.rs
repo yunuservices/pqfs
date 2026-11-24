@@ -48,11 +48,9 @@ impl Crypto {
             slots: vec![slot],
             mac: [0u8; MAC_LEN],
         };
-        seal_header(&mut header, master_key.as_slice())?;
+        write_header(backend, &mut header, master_key.as_slice())?;
 
-        let this = Self::from_master_key(master_key.as_slice(), header)?;
-        this.save(backend)?;
-        Ok(this)
+        Self::from_master_key(master_key.as_slice())
     }
 
     #[cfg(test)]
@@ -67,15 +65,8 @@ impl Crypto {
     }
 
     pub(crate) fn unlock(backend: &Path, credential: Unlock<'_>) -> Result<Self> {
-        let (header, master_key) = open(backend, &credential)?;
-        Self::from_master_key(master_key.as_slice(), header)
-    }
-
-    pub(crate) fn save(&self, backend: &Path) -> Result<()> {
-        let header_path = backend.join(Self::HEADER_FILE);
-        let data = bincode::serialize(&self.header)?;
-        fs::write(&header_path, data)?;
-        Ok(())
+        let (_, master_key) = open(backend, &credential)?;
+        Self::from_master_key(master_key.as_slice())
     }
 }
 
@@ -302,10 +293,11 @@ mod tests {
     #[test]
     fn init_creates_a_single_password_slot() {
         let dir = tempfile::tempdir().unwrap();
-        let crypto = volume(dir.path());
-        assert_eq!(crypto.header.version, HEADER_VERSION);
-        assert_eq!(crypto.header.slots.len(), 1);
-        assert_eq!(crypto.header.slots[0].kind(), "password");
+        let _ = volume(dir.path());
+        let header = read_header(dir.path()).unwrap();
+        assert_eq!(header.version, HEADER_VERSION);
+        assert_eq!(header.slots.len(), 1);
+        assert_eq!(header.slots[0].kind(), "password");
     }
 
     #[test]
@@ -399,9 +391,9 @@ mod tests {
     #[test]
     fn load_rejects_a_tampered_slot_list() {
         let dir = tempfile::tempdir().unwrap();
-        let crypto = volume(dir.path());
+        let _ = volume(dir.path());
 
-        let mut header = crypto.header.clone();
+        let mut header = read_header(dir.path()).unwrap();
         header.slots.push(header.slots[0].clone());
         fs::write(
             dir.path().join(Crypto::HEADER_FILE),
@@ -552,8 +544,8 @@ mod tests {
             t_cost: 2,
             p_cost: 1,
         };
-        let crypto = Crypto::init_with_params("pw", dir.path(), kdf).unwrap();
-        match &crypto.header.slots[0] {
+        Crypto::init_with_params("pw", dir.path(), kdf).unwrap();
+        match &read_header(dir.path()).unwrap().slots[0] {
             KeySlot::Password { kdf: stored, .. } => assert_eq!(*stored, kdf),
             other => panic!("unexpected slot {other:?}"),
         }

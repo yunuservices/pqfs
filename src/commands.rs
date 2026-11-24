@@ -127,7 +127,7 @@ pub fn rekey(mut args: PasswdArgs) -> Result<()> {
     let identity = args.credential.identity_file()?;
     let (mut header, old_master_key) =
         volume::open(&args.backend, &args.credential.unlock(&identity)?)?;
-    let old = Crypto::from_master_key(old_master_key.as_slice(), header.clone())?;
+    let old = Crypto::from_master_key(old_master_key.as_slice())?;
 
     let new_master_key = volume::random_master_key();
 
@@ -160,7 +160,7 @@ pub fn rekey(mut args: PasswdArgs) -> Result<()> {
     }
     header.slots = slots;
 
-    let new = Crypto::from_master_key(new_master_key.as_slice(), header.clone())?;
+    let new = Crypto::from_master_key(new_master_key.as_slice())?;
     let index = crate::fs::rekey_index(&args.backend, &old, &new)?;
     volume::commit_rekey(
         &args.backend,

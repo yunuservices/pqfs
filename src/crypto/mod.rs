@@ -24,7 +24,6 @@ pub(crate) const MAX_HEADER_BYTES: u64 = 256 * 1024;
 /// Hybrid crypto engine: classical password + ML-KEM selected-parameter-set shared secret.
 pub struct Crypto {
     pub(crate) cipher: XChaCha20Poly1305,
-    pub(crate) header: VolumeHeader,
     pub(crate) filename_cipher: XChaCha20Poly1305,
     pub(crate) filename_hash_key: keys::SecretKey,
 }
