@@ -177,20 +177,33 @@ impl Filesystem for Pqfs {
         _lock_owner: Option<u64>,
         reply: ReplyData,
     ) {
+        let inner = Arc::clone(&self.inner);
         let crypto = Arc::clone(&self.crypto);
         let lock = self.inode_lock(ino);
 
-        let (entry, data_path) = {
+        let (kind, data_path) = {
             let inner = self.read_inner();
-            let entry = inner.entries.get(&ino).cloned();
+            let kind = inner.entries.get(&ino).map(|e| e.kind.clone());
             let data_path = inner.data_path(ino);
-            (entry, data_path)
+            (kind, data_path)
         };
 
-        match entry {
-            Some(entry) if matches!(entry.kind, EntryKind::File) => {
+        match kind {
+            Some(EntryKind::File) => {
                 self.spawn_job(move || {
                     let _guard = lock.read().unwrap_or_else(|e| e.into_inner());
+
+                    let entry = {
+                        let inner = inner.read().unwrap_or_else(|e| e.into_inner());
+                        match inner.entries.get(&ino) {
+                            Some(entry) => entry.clone(),
+                            None => {
+                                reply.error(ENOENT);
+                                return;
+                            }
+                        }
+                    };
+
                     PqfsInner::do_read(crypto.as_ref(), &entry, data_path, offset, size, reply);
                 });
             }
