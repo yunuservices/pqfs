@@ -10,7 +10,7 @@ use anyhow::{Context, Result, bail};
 use fuser::{
     BsdFileFlags, Config, Errno, FileHandle, Filesystem, INodeNo, LockOwner, MountOption,
     OpenFlags, Owner, RenameFlags, ReplyAttr, ReplyCreate, ReplyData, ReplyDirectory, ReplyEmpty,
-    ReplyEntry, ReplyOpen, ReplyStatfs, ReplyWrite, Request, TimeOrNow, WriteFlags,
+    ReplyEntry, ReplyOpen, ReplyStatfs, ReplyWrite, Request, SessionACL, TimeOrNow, WriteFlags,
 };
 use std::time::SystemTime;
 use tracing::{debug, error};
@@ -88,29 +88,8 @@ impl Pqfs {
         let inner = PqfsInner::load(args.backend.clone(), &crypto)?;
         let fs = Self::new(inner, Arc::clone(&crypto));
 
-        let mut mount_options = vec![
-            MountOption::FSName("pqfs".to_string()),
-            MountOption::Subtype("pqfs".to_string()),
-            MountOption::NoAtime,
-        ];
-
-        if args.options.iter().any(|o| o == "ro") {
-            mount_options.push(MountOption::RO);
-        } else {
-            mount_options.push(MountOption::RW);
-        }
-
-        for opt in &args.options {
-            if opt == "ro" || opt == "rw" {
-                continue;
-            }
-            mount_options.push(MountOption::CUSTOM(opt.clone()));
-        }
-
         debug!("pqfs mounted at {}", args.mountpoint.display());
-        let mut config = Config::default();
-        config.mount_options = mount_options;
-        fuser::mount(fs, &args.mountpoint, &config)
+        fuser::mount(fs, &args.mountpoint, &mount_config(&args.options))
             .with_context(|| format!("failed to mount at {}", args.mountpoint.display()))?;
         Ok(())
     }
@@ -594,6 +573,31 @@ impl Filesystem for Pqfs {
     }
 }
 
+fn mount_config(options: &[String]) -> Config {
+    let mut config = Config::default();
+    config.mount_options = vec![
+        MountOption::FSName("pqfs".to_string()),
+        MountOption::Subtype("pqfs".to_string()),
+        MountOption::NoAtime,
+    ];
+
+    if options.iter().any(|o| o == "ro") {
+        config.mount_options.push(MountOption::RO);
+    } else {
+        config.mount_options.push(MountOption::RW);
+    }
+
+    for opt in options {
+        match opt.as_str() {
+            "ro" | "rw" => {}
+            "allow_other" => config.acl = SessionACL::All,
+            "allow_root" => config.acl = SessionACL::RootAndOwner,
+            _ => config.mount_options.push(MountOption::CUSTOM(opt.clone())),
+        }
+    }
+    config
+}
+
 struct BackingStoreStats {
     blocks: u64,
     blocks_free: u64,
@@ -621,4 +625,42 @@ fn backing_store_stats(backend: &Path) -> std::io::Result<BackingStoreStats> {
         block_size: raw.f_bsize as u32,
         fragment_size: raw.f_frsize as u32,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn options(list: &[&str]) -> Vec<String> {
+        list.iter().map(|o| o.to_string()).collect()
+    }
+
+    #[test]
+    fn allow_other_and_allow_root_set_the_session_acl() {
+        assert_eq!(mount_config(&[]).acl, SessionACL::Owner);
+        assert_eq!(
+            mount_config(&options(&["allow_other"])).acl,
+            SessionACL::All
+        );
+        assert_eq!(
+            mount_config(&options(&["allow_root"])).acl,
+            SessionACL::RootAndOwner
+        );
+    }
+
+    #[test]
+    fn acl_options_are_not_passed_through_as_custom_options() {
+        let config = mount_config(&options(&["allow_other", "allow_root", "ro", "fsname=x"]));
+        let custom: Vec<_> = config
+            .mount_options
+            .iter()
+            .filter_map(|o| match o {
+                MountOption::CUSTOM(value) => Some(value.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(custom, ["fsname=x"]);
+        assert!(config.mount_options.contains(&MountOption::RO));
+        assert!(!config.mount_options.contains(&MountOption::RW));
+    }
 }
