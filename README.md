@@ -61,11 +61,12 @@ makes "harvest now, decrypt later" a losing strategy against a shared volume.
 
 ## Build
 
-Linux or WSL is required. `fuser` links against libfuse3.
+Linux or WSL is required. Building needs only Rust 1.88 or newer; mounting
+needs `fusermount3`, which the `fuse3` package provides.
 
 ```bash
-# Debian/Ubuntu dependencies
-sudo apt-get install -y libfuse3-dev pkg-config
+# Debian/Ubuntu runtime dependency
+sudo apt-get install -y fuse3
 
 # Default: ML-KEM-768
 cargo build --release
@@ -198,9 +199,9 @@ last one.
 # Build image and keep a container running for manual testing
 docker compose up -d pqfs
 
-# Create and mount a volume inside the container
-docker compose exec pqfs pqfs mount /data /mnt/pqfs --password smoke-test --init
-docker compose exec pqfs pqfs mount /data /mnt/pqfs --password smoke-test
+# Mount the volume in the background, creating it on first use
+docker compose exec -d pqfs pqfs mount /data /mnt/pqfs --password smoke-test --init
+docker compose exec pqfs ls /mnt/pqfs
 
 # Or run the one-shot smoke test (creates, writes, reads, unmounts)
 docker compose --profile test run --rm smoke-test
