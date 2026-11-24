@@ -2,6 +2,7 @@
 name = "pqfs"
 version = "0.1.0"
 edition = "2024"
+rust-version = "1.88"
 authors = ["yunuservices <yunuservices@gmail.com>"]
 description = "A hybrid post-quantum FUSE filesystem in Rust (research prototype)"
 license = "MIT"
