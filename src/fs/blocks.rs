@@ -26,6 +26,12 @@ fn record_len(size: u64, index: u64) -> usize {
     NONCE_LEN + plaintext_len(size, index) + TAG_LEN
 }
 
+fn stored_record_len(file_len: u64, index: u64) -> usize {
+    file_len
+        .saturating_sub(record_offset(index))
+        .min(FULL_RECORD) as usize
+}
+
 fn record_offset(index: u64) -> u64 {
     index * FULL_RECORD
 }
@@ -35,14 +41,16 @@ fn read_block(
     crypto: &Crypto,
     key: &[u8],
     size: u64,
+    file_len: u64,
     index: u64,
 ) -> Result<Vec<u8>> {
-    let len = record_len(size, index);
-    let mut buf = vec![0u8; len];
+    let mut buf = vec![0u8; stored_record_len(file_len, index)];
     file.seek(SeekFrom::Start(record_offset(index)))?;
     file.read_exact(&mut buf)
         .with_context(|| format!("failed to read block {index}"))?;
-    crypto.decrypt_block(key, index, &buf)
+    let mut block = crypto.decrypt_block(key, index, &buf)?;
+    block.truncate(plaintext_len(size, index));
+    Ok(block)
 }
 
 fn write_block(
@@ -86,9 +94,10 @@ pub(crate) fn read_range(
 
     let mut file =
         File::open(path).with_context(|| format!("failed to open {}", path.display()))?;
+    let file_len = file.metadata()?.len();
     let mut out = Vec::with_capacity((end - offset) as usize);
     for index in first..=last {
-        let block = read_block(&mut file, crypto, key, size, index)?;
+        let block = read_block(&mut file, crypto, key, size, file_len, index)?;
         let block_start = index * BLOCK_PLAINTEXT as u64;
         let from = offset.saturating_sub(block_start) as usize;
         let to = ((end - block_start) as usize).min(block.len());
@@ -116,11 +125,12 @@ pub(crate) fn write_range(
 
     let touched_from = (offset / BLOCK_PLAINTEXT as u64).min(old_blocks.saturating_sub(1));
     let mut file = open_rw(path)?;
+    let file_len = file.metadata()?.len();
 
     for index in touched_from..new_blocks {
         let target = plaintext_len(new_size, index);
         let mut buf = if index < old_blocks {
-            read_block(&mut file, crypto, key, size, index)?
+            read_block(&mut file, crypto, key, size, file_len, index)?
         } else {
             Vec::new()
         };
@@ -166,9 +176,10 @@ pub(crate) fn truncate(
     }
 
     let mut file = open_rw(path)?;
+    let file_len = file.metadata()?.len();
     let last = new_blocks - 1;
     let target = plaintext_len(new_size, last);
-    let mut buf = read_block(&mut file, crypto, key, size, last)?;
+    let mut buf = read_block(&mut file, crypto, key, size, file_len, last)?;
     buf.truncate(target);
     write_block(&mut file, crypto, key, last, &buf)?;
     file.set_len(record_offset(last) + record_len(new_size, last) as u64)?;
@@ -293,6 +304,33 @@ mod tests {
             read_range(&crypto, &key, &path, 0, 0, 4096)
                 .unwrap()
                 .is_empty()
+        );
+    }
+
+    #[test]
+    fn a_stale_size_still_reads_the_last_block() {
+        let (dir, crypto, key) = setup();
+        let path = dir.path().join("f");
+        let stale = write_range(&crypto, &key, &path, 0, 0, b"hello").unwrap();
+        write_range(&crypto, &key, &path, stale, stale, b" world").unwrap();
+
+        assert_eq!(
+            read_range(&crypto, &key, &path, stale, 0, 4096).unwrap(),
+            b"hello"
+        );
+    }
+
+    #[test]
+    fn a_write_after_a_stale_size_zero_fills_past_it() {
+        let (dir, crypto, key) = setup();
+        let path = dir.path().join("f");
+        let stale = write_range(&crypto, &key, &path, 0, 0, b"hello").unwrap();
+        write_range(&crypto, &key, &path, stale, stale, b" world").unwrap();
+
+        let size = write_range(&crypto, &key, &path, stale, 8, b"!").unwrap();
+        assert_eq!(
+            read_range(&crypto, &key, &path, size, 0, 4096).unwrap(),
+            b"hello\0\0\0!"
         );
     }
 
